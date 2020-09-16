@@ -1,4 +1,4 @@
 <?jelly escape-by-default='true'?>
 <div>
-    Provides a pluggable storage extension for the junit plugin with PostgreSQL
+    Provides a pluggable storage extension for the junit plugin with a SQL database
 </div>
