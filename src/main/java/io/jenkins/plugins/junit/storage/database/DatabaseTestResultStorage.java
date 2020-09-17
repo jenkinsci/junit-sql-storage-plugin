@@ -151,7 +151,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             @Override
             public List<TrendTestResultSummary> getTrendTestResultSummary() {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(case when errorDetails is not null then 1 else 0 end) as failCount, sum(case when skipped is not null then 1 else 0 end) as skipCount, sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount FROM " +  DatabaseTestResultStorage.CASE_RESULTS_TABLE +  " WHERE job = ? group by build;")) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(case when errorDetails is not null then 1 else 0 end) as failCount, sum(case when skipped is not null then 1 else 0 end) as skipCount, sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount FROM " +  DatabaseTestResultStorage.CASE_RESULTS_TABLE +  " WHERE job = ? group by build order by build;")) {
                         statement.setString(1, job);
                         try (ResultSet result = statement.executeQuery()) {
 
@@ -174,7 +174,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             @Override
             public List<TestDurationResultSummary> getTestDurationResultSummary() {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(duration) as duration FROM " +  DatabaseTestResultStorage.CASE_RESULTS_TABLE +  " WHERE job = ? group by build;")) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(duration) as duration FROM " +  DatabaseTestResultStorage.CASE_RESULTS_TABLE +  " WHERE job = ? group by build order by build;")) {
                         statement.setString(1, job);
                         try (ResultSet result = statement.executeQuery()) {
 
