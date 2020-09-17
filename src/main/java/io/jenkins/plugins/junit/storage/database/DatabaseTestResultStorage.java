@@ -16,7 +16,6 @@ import hudson.tasks.junit.TestResultSummary;
 import hudson.tasks.junit.TrendTestResultSummary;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageDescriptor;
-import io.jenkins.plugins.junit.storage.database.Messages;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
 import java.io.IOException;
 import java.sql.Connection;
@@ -41,14 +40,21 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
     static final String CASE_RESULTS_TABLE = "caseResults";
 
-    private transient final ConnectionSupplier connectionSupplier = new LocalConnectionSupplier();
+    private transient ConnectionSupplier connectionSupplier;
 
     @DataBoundConstructor
     public DatabaseTestResultStorage() {}
 
+    public ConnectionSupplier getConnectionSupplier() {
+        if (connectionSupplier == null) {
+            connectionSupplier = new LocalConnectionSupplier();
+        }
+        return connectionSupplier;
+    }
+
     @Override public RemotePublisher createRemotePublisher(Run<?, ?> build) throws IOException {
         try {
-            connectionSupplier.connection(); // make sure we start a local server and create table first
+            getConnectionSupplier().connection(); // make sure we start a local server and create table first
         } catch (SQLException x) {
             throw new IOException(x);
         }
@@ -74,7 +80,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         return new TestResultImpl() {
             private <T> T query(Querier<T> querier) {
                 try {
-                    Connection connection = connectionSupplier.connection();
+                    Connection connection = getConnectionSupplier().connection();
                     return querier.run(connection);
                 } catch (SQLException x) {
                     throw new RuntimeException(x);
