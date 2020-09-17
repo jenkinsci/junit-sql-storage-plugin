@@ -41,9 +41,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
     static final String CASE_RESULTS_TABLE = "caseResults";
 
-    static boolean queriesPermitted;
-
-    private final ConnectionSupplier connectionSupplier = new LocalConnectionSupplier();
+    private transient final ConnectionSupplier connectionSupplier = new LocalConnectionSupplier();
 
     @DataBoundConstructor
     public DatabaseTestResultStorage() {}
@@ -75,9 +73,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     @Override public TestResultImpl load(String job, int build) {
         return new TestResultImpl() {
             private <T> T query(Querier<T> querier) {
-                if (!queriesPermitted) {
-                    throw new IllegalStateException("Should not have been running any queries yet");
-                }
                 try {
                     Connection connection = connectionSupplier.connection();
                     return querier.run(connection);
