@@ -1,5 +1,6 @@
 package io.jenkins.plugins.junit.storage.database;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.Util;
@@ -25,7 +26,10 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import jenkins.model.Jenkins;
 import org.jenkinsci.Symbol;
@@ -88,12 +92,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             }
             private int getCaseCount(String and) {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT COUNT(*) FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " WHERE job = ? AND build = ?" + and)) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT COUNT(*) FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ?" + and)) {
                         statement.setString(1, job);
                         statement.setInt(2, build);
                         try (ResultSet result = statement.executeQuery()) {
                             result.next();
-                            return result.getInt(1);
+                            int anInt = result.getInt(1);
+                            return anInt;
                         }
                     }
                 });
@@ -101,12 +106,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
             private List<CaseResult> retrieveCaseResult(String whereCondition) {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, package, testname, classname, errordetails, skipped, duration FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND " + whereCondition)) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, package, testname, classname, errordetails, skipped, duration FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND " + whereCondition)) {
                         statement.setString(1, job);
                         statement.setInt(2, build);
                         try (ResultSet result = statement.executeQuery()) {
 
                             List<CaseResult> results = new ArrayList<>();
+                            Map<String, ClassResult> classResults = new HashMap<>();
+                            TestResult parent = new TestResult(this);
                             while (result.next()) {
                                 String testName = result.getString("testname");
                                 String packageName = result.getString("package");
@@ -117,11 +124,18 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 float duration = result.getFloat("duration");
 
                                 SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
-                                suiteResult.setParent(new TestResult(this));
+                                suiteResult.setParent(parent);
                                 CaseResult caseResult = new CaseResult(suiteResult, className, testName, errorDetails, skipped, duration);
-                                caseResult.setClass(new ClassResult(new PackageResult(new TestResult(this), packageName), className));
+                                ClassResult classResult = classResults.get(className);
+                                if (classResult == null) {
+                                    classResult = new ClassResult(new PackageResult(new TestResult(this), packageName), className);
+                                }
+                                classResult.add(caseResult);
+                                caseResult.setClass(classResult);
+                                classResults.put(className, classResult);
                                 results.add(caseResult);
                             }
+                            classResults.values().forEach(ClassResult::tally);
                             return results;
                         }
                     }
@@ -131,18 +145,47 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             @Override
             public List<PackageResult> getAllPackageResults() {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT DISTINCT package FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " WHERE job = ? AND build = ?")) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, testname, package, classname, errordetails, skipped, duration FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ?")) {
                         statement.setString(1, job);
                         statement.setInt(2, build);
                         try (ResultSet result = statement.executeQuery()) {
 
-                            List<PackageResult> results = new ArrayList<>();
+                            Map<String, PackageResult> results = new HashMap<>();
+                            Map<String, ClassResult> classResults = new HashMap<>();
+                            TestResult parent = new TestResult(this);
                             while (result.next()) {
+                                String testName = result.getString("testname");
                                 String packageName = result.getString("package");
+                                String errorDetails = result.getString("errordetails");
+                                String suite = result.getString("suite");
+                                String className = result.getString("classname");
+                                String skipped = result.getString("skipped");
+                                float duration = result.getFloat("duration");
 
-                                results.add(new PackageResult(new TestResult(this), packageName));
+                                SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+                                suiteResult.setParent(parent);
+                                CaseResult caseResult = new CaseResult(suiteResult, className, testName, errorDetails, skipped, duration);
+                                PackageResult packageResult = results.get(packageName);
+                                if (packageResult == null) {
+                                    packageResult = new PackageResult(parent, packageName);
+                                }
+                                ClassResult classResult = classResults.get(className);
+                                if (classResult == null) {
+                                    classResult = new ClassResult(new PackageResult(parent, packageName), className);
+                                }
+                                caseResult.setClass(classResult);
+                                classResult.add(caseResult);
+
+                                classResults.put(className, classResult);
+                                packageResult.add(caseResult);
+
+                                results.put(packageName, packageResult);
                             }
-                            return results;
+                            classResults.values().forEach(ClassResult::tally);
+                            final List<PackageResult> resultList = new ArrayList<>(results.values());
+                            resultList.forEach((PackageResult::tally));
+                            resultList.sort(Comparator.comparing(PackageResult::getName, String::compareTo));
+                            return resultList;
                         }
                     }
                 });
@@ -151,7 +194,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             @Override
             public List<TrendTestResultSummary> getTrendTestResultSummary() {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(case when errorDetails is not null then 1 else 0 end) as failCount, sum(case when skipped is not null then 1 else 0 end) as skipCount, sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount FROM " +  DatabaseTestResultStorage.CASE_RESULTS_TABLE +  " WHERE job = ? group by build order by build;")) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(case when errorDetails is not null then 1 else 0 end) as failCount, sum(case when skipped is not null then 1 else 0 end) as skipCount, sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount FROM " +  CASE_RESULTS_TABLE +  " WHERE job = ? group by build order by build;")) {
                         statement.setString(1, job);
                         try (ResultSet result = statement.executeQuery()) {
 
@@ -174,7 +217,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             @Override
             public List<TestDurationResultSummary> getTestDurationResultSummary() {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(duration) as duration FROM " +  DatabaseTestResultStorage.CASE_RESULTS_TABLE +  " WHERE job = ? group by build order by build;")) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT build, sum(duration) as duration FROM " +  CASE_RESULTS_TABLE +  " WHERE job = ? group by build order by build;")) {
                         statement.setString(1, job);
                         try (ResultSet result = statement.executeQuery()) {
 
@@ -198,7 +241,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         statement.setString(1, job);
                         try (ResultSet result = statement.executeQuery()) {
                             result.next();
-                            return result.getInt("count");
+                            int count = result.getInt("count");
+                            return count;
                         }
                     }
                 });
@@ -206,26 +250,80 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
             @Override
             public PackageResult getPackageResult(String packageName) {
-                return new PackageResult(new TestResult(this), packageName);
+                return query(connection -> {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, testname, classname, errordetails, skipped, duration FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND package = ?")) {
+                        statement.setString(1, job);
+                        statement.setInt(2, build);
+                        statement.setString(3, packageName);
+                        try (ResultSet result = statement.executeQuery()) {
+
+                            PackageResult packageResult = new PackageResult(new TestResult(this), packageName);
+                            Map<String, ClassResult> classResults = new HashMap<>();
+                            while (result.next()) {
+                                String testName = result.getString("testname");
+                                String errorDetails = result.getString("errordetails");
+                                String suite = result.getString("suite");
+                                String className = result.getString("classname");
+                                String skipped = result.getString("skipped");
+                                float duration = result.getFloat("duration");
+
+                                SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+                                suiteResult.setParent(new TestResult(this));
+                                CaseResult caseResult = new CaseResult(suiteResult, className, testName, errorDetails, skipped, duration);
+
+                                ClassResult classResult = classResults.get(className);
+                                if (classResult == null) {
+                                    classResult = new ClassResult(packageResult, className);
+                                }
+                                classResult.add(caseResult);
+                                classResults.put(className, classResult);
+                                caseResult.setClass(classResult);
+
+                                packageResult.add(caseResult);
+                            }
+                            classResults.values().forEach(ClassResult::tally);
+                            packageResult.tally();
+                            return packageResult;
+                        }
+                    }
+                });
+
             }
 
             @Override
             public ClassResult getClassResult(String name) {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT package, classname FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND classname = ?")) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, package, testname, classname, errordetails, skipped, duration FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND classname = ?")) {
                         statement.setString(1, job);
                         statement.setInt(2, build);
                         statement.setString(3, name);
                         try (ResultSet result = statement.executeQuery()) {
 
-                            if (result.next()) {
+                            ClassResult classResult = null;
+                            TestResult parent = new TestResult(this);
+                            while (result.next()) {
+                                String testName = result.getString("testname");
                                 String packageName = result.getString("package");
+                                String errorDetails = result.getString("errordetails");
+                                String suite = result.getString("suite");
                                 String className = result.getString("classname");
+                                String skipped = result.getString("skipped");
+                                float duration = result.getFloat("duration");
 
-                                PackageResult packageResult = new PackageResult(new TestResult(this), packageName);
-                                return new ClassResult(packageResult, className);
+                                if (classResult == null) {
+                                    classResult = new ClassResult(new PackageResult(new TestResult(this), packageName), className);
+                                }
+
+                                SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+                                suiteResult.setParent(parent);
+                                CaseResult caseResult = new CaseResult(suiteResult, className, testName, errorDetails, skipped, duration);
+                                classResult.add(caseResult);
+                                caseResult.setClass(classResult);
                             }
-                            return null;
+                            if (classResult != null) {
+                                classResult.tally();
+                            }
+                            return classResult;
                         }
                     }
                 });
@@ -239,7 +337,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
                     try (PreparedStatement statement = connection.prepareStatement(
                         "SELECT build " +
-                            "FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " " +
+                            "FROM " + CASE_RESULTS_TABLE + " " +
                             "WHERE job = ? " +
                             "AND build < ? " +
                             "AND suite = ? " +
@@ -267,7 +365,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     }
                     try (PreparedStatement statement = connection.prepareStatement(
                         "SELECT build " +
-                            "FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " " +
+                            "FROM " + CASE_RESULTS_TABLE + " " +
                             "WHERE job = ? " +
                             "AND build > ? " +
                             "AND suite = ? " +
@@ -298,13 +396,23 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             }
 
             @Override
+            public String getJobName() {
+                return job;
+            }
+
+            @Override
+            public int getBuild() {
+                return build;
+            }
+
+            @Override
             public List<CaseResult> getFailedTestsByPackage(String packageName) {
                 return getByPackage(packageName, "AND errorDetails IS NOT NULL");
             }
 
             private List<CaseResult> getByPackage(String packageName, String filter) {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, testname, classname, errordetails, duration, skipped FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND package = ? " + filter)) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, testname, classname, errordetails, duration, skipped FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND package = ? " + filter)) {
                         statement.setString(1, job);
                         statement.setInt(2, build);
                         statement.setString(3, packageName);
@@ -337,13 +445,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             @Override
             public CaseResult getCaseResult(String testName) {
                 return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, testname, package, classname, errordetails, skipped, duration FROM " + DatabaseTestResultStorage.CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND testname = ?")) {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT suite, testname, package, classname, errordetails, skipped, duration FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND testname = ?")) {
                         statement.setString(1, job);
                         statement.setInt(2, build);
                         statement.setString(3, testName);
                         try (ResultSet result = statement.executeQuery()) {
 
                             CaseResult caseResult = null;
+
                             if (result.next()) {
                                 String resultTestName = result.getString("testname");
                                 String errorDetails = result.getString("errordetails");
@@ -356,7 +465,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
                                 suiteResult.setParent(new TestResult(this));
                                 caseResult = new CaseResult(suiteResult, className, resultTestName, errorDetails, skipped, duration);
-                                caseResult.setClass(new ClassResult(new PackageResult(new TestResult(this), packageName), className));
+                                PackageResult packageResult = new PackageResult(new TestResult(this), packageName);
+                                ClassResult classResult = new ClassResult(packageResult, className);
+                                classResult.add(caseResult);
+                                packageResult.add(caseResult);
+                                packageResult.tally();
+                                caseResult.tally();
+                                caseResult.setClass(classResult);
                             }
                             return caseResult;
                         }
@@ -366,27 +481,83 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
             }
 
+            @Override
+            public SuiteResult getSuite(String name) {
+                return query(connection -> {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT testname, package, classname, errordetails, skipped, duration FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build = ? AND suite = ?")) {
+                        statement.setString(1, job);
+                        statement.setInt(2, build);
+                        statement.setString(3, name);
+                        try (ResultSet result = statement.executeQuery()) {
+                            SuiteResult suiteResult = new SuiteResult(name, null, null, null);
+                            TestResult parent = new TestResult(this);
+                            while (result.next()) {
+                                String resultTestName = result.getString("testname");
+                                String errorDetails = result.getString("errordetails");
+                                String packageName = result.getString("package");
+                                String className = result.getString("classname");
+                                String skipped = result.getString("skipped");
+                                float duration = result.getFloat("duration");
+
+                                suiteResult.setParent(parent);
+                                CaseResult caseResult = new CaseResult(suiteResult, className, resultTestName, errorDetails, skipped, duration);
+                                final PackageResult packageResult = new PackageResult(parent, packageName);
+                                packageResult.add(caseResult);
+                                ClassResult classResult = new ClassResult(packageResult, className);
+                                classResult.add(caseResult);
+                                caseResult.setClass(classResult);
+                                suiteResult.addCase(caseResult);
+                            }
+                            return suiteResult;
+                        }
+                    }
+                });
+
+            }
+
+            @Override
+            public float getTotalTestDuration() {
+                return query(connection -> {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT sum(duration) as duration FROM " +  CASE_RESULTS_TABLE +  " WHERE job = ? and build = ?;")) {
+                        statement.setString(1, job);
+                        statement.setInt(2, build);
+                        try (ResultSet result = statement.executeQuery()) {
+                            if (result.next()) {
+                                return result.getFloat("duration");
+                            }
+                            return 0f;
+                        }
+                    }
+                });
+            }
+
             @Override public int getFailCount() {
-                return getCaseCount(" AND errorDetails IS NOT NULL");
+                int caseCount = getCaseCount(" AND errorDetails IS NOT NULL");
+                return caseCount;
             }
             @Override public int getSkipCount() {
-                return getCaseCount(" AND skipped IS NOT NULL");
+                int caseCount = getCaseCount(" AND skipped IS NOT NULL");
+                return caseCount;
             }
             @Override public int getPassCount() {
-                return getCaseCount(" AND errorDetails IS NULL AND skipped IS NULL");
+                int caseCount = getCaseCount(" AND errorDetails IS NULL AND skipped IS NULL");
+                return caseCount;
             }
             @Override public int getTotalCount() {
-                return getCaseCount("");
+                int caseCount = getCaseCount("");
+                return caseCount;
             }
 
             @Override
             public List<CaseResult> getFailedTests() {
-                return getCaseResults("errordetails");
+                List<CaseResult> errordetails = getCaseResults("errordetails");
+                return errordetails;
             }
 
             @Override
             public List<CaseResult> getSkippedTests() {
-                return getCaseResults("skipped");
+                List<CaseResult> errordetails = getCaseResults("skipped");
+                return errordetails;
             }
 
             @Override
@@ -396,12 +567,33 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
             @Override
             public List<CaseResult> getPassedTests() {
-                return retrieveCaseResult("errordetails IS NULL AND skipped IS NULL");
+                List<CaseResult> errordetails = retrieveCaseResult("errordetails IS NULL AND skipped IS NULL");
+                return errordetails;
             }
 
             @Override
             public List<CaseResult> getPassedTestsByPackage(String packageName) {
                 return getByPackage(packageName, "AND errordetails IS NULL AND skipped IS NULL");
+            }
+
+            @Override
+            @CheckForNull
+            public TestResult getPreviousResult() {
+                return query(connection -> {
+                    try (PreparedStatement statement = connection.prepareStatement("SELECT build FROM " + CASE_RESULTS_TABLE + " WHERE job = ? AND build < ? ORDER BY build DESC LIMIT 1")) {
+                        statement.setString(1, job);
+                        statement.setInt(2, build);
+                        try (ResultSet result = statement.executeQuery()) {
+
+                            if (result.next()) {
+                                int previousBuild = result.getInt("build");
+
+                                return new TestResult(load(job, previousBuild));
+                            }
+                            return null;
+                        }
+                    }
+                });
             }
 
             @NonNull
