@@ -178,7 +178,7 @@ public class DatabaseTestResultStorageTest {
         // comment this out if you hit the below test containers issue
         postgres.start();
         
-        PostgreSQLDatabase database = new PostgreSQLDatabase(postgres.getHost() + ":" + postgres.getPortBindings().get(0), postgres.getDatabaseName(), postgres.getUsername(), Secret.fromString(postgres.getPassword()), null);
+        PostgreSQLDatabase database = new PostgreSQLDatabase(postgres.getHost() + ":" + postgres.getMappedPort(5432), postgres.getDatabaseName(), postgres.getUsername(), Secret.fromString(postgres.getPassword()), null);
 //        Use the below if test containers doesn't work for you, i.e. MacOS edge release of docker broken Sep 2020 
 //        https://github.com/testcontainers/testcontainers-java/issues/3166
 //        PostgreSQLDatabase database = new PostgreSQLDatabase("localhost", "postgres", "postgres", Secret.fromString("postgres"), null);
