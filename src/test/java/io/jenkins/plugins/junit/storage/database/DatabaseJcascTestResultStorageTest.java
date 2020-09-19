@@ -5,7 +5,6 @@ import io.jenkins.plugins.casc.ConfiguratorRegistry;
 import io.jenkins.plugins.casc.misc.ConfiguredWithCode;
 import io.jenkins.plugins.casc.misc.JenkinsConfiguredWithCodeRule;
 import io.jenkins.plugins.casc.model.CNode;
-import io.jenkins.plugins.junit.storage.FileJunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
 import org.junit.ClassRule;
 import org.junit.Test;
