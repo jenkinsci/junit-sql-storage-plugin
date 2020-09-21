@@ -619,8 +619,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         @Override public void publish(TestResult result, TaskListener listener) throws IOException {
             try {
-                Connection connection = connectionSupplier.connection();
-                try (PreparedStatement statement = connection.prepareStatement("INSERT INTO " + CASE_RESULTS_TABLE + " (job, build, suite, package, className, testName, errorDetails, skipped, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                try (Connection connection = connectionSupplier.connection(); PreparedStatement statement = connection.prepareStatement("INSERT INTO " + CASE_RESULTS_TABLE + " (job, build, suite, package, className, testName, errorDetails, skipped, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
                     int count = 0;
                     for (SuiteResult suiteResult : result.getSuites()) {
                         for (CaseResult caseResult : suiteResult.getCases()) {
