@@ -5,12 +5,15 @@ import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
 import java.sql.SQLException;
 import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 import static hudson.init.InitMilestone.SYSTEM_CONFIG_ADAPTED;
 
+@Restricted(NoExternalUse.class)
 public class DatabaseSchemaLoader {
     
-    public static boolean MIGRATED; 
+    static boolean MIGRATED; 
     
     @Initializer(after = SYSTEM_CONFIG_ADAPTED)
     public static void migrateSchema() throws SQLException {
