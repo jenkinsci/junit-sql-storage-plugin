@@ -41,7 +41,6 @@ import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
-import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.CASE_RESULTS_TABLE;
 import static java.util.Objects.requireNonNull;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
@@ -83,7 +82,7 @@ public class DatabaseTestResultStorageTest {
                     "}", true));
             WorkflowRun b = p.scheduleBuild2(0).get();
             try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
-                 PreparedStatement statement = connection.prepareStatement("SELECT * FROM " + CASE_RESULTS_TABLE);
+                 PreparedStatement statement = connection.prepareStatement("SELECT * FROM caseResults");
                  ResultSet result = statement.executeQuery()) {
                 printResultSet(result);
             }
