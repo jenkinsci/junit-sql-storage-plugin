@@ -105,7 +105,7 @@ public class DatabaseTestResultStorageTest {
                         childNames.add(((Element) item).getTagName());
                     }
                 }
-                assertEquals(buildXml, ImmutableSet.of("healthScaleFactor", "testData", "descriptions"), childNames);
+                assertEquals(buildXml, ImmutableSet.of("checksName", "healthScaleFactor", "testData", "descriptions"), childNames);
             }
             {
                 TestResultAction a = b.getAction(TestResultAction.class);
