@@ -27,7 +27,7 @@
             <dependency>
                 <groupId>io.jenkins.tools.bom</groupId>
                 <artifactId>bom-2.235.x</artifactId>
-                <version>18</version>
+                <version>19</version>
                 <scope>import</scope>
                 <type>pom</type>
             </dependency>
@@ -68,7 +68,7 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>junit</artifactId>
-            <version>1.43</version>
+            <version>1.47</version>
         </dependency>
         <dependency>
             <groupId>com.github.spotbugs</groupId>
