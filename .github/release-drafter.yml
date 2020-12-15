@@ -1,2 +1,2 @@
 _extends: .github
-tag-template: junit-postgresql-$NEXT_MINOR_VERSION
+tag-template: junit-sql-storage-$NEXT_MINOR_VERSION
