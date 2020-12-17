@@ -26,6 +26,7 @@ public class DatabaseSchemaLoader {
                     .baselineOnMigrate(true)
                     .table("junit_flyway_schema_history")
                     .dataSource(dataSource)
+                    .locations("db/migration/mysql")
                     .load();
             flyway.migrate();
             MIGRATED = true;
