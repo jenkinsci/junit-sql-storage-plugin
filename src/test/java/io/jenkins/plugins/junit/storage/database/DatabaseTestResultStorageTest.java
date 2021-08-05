@@ -10,6 +10,7 @@ import hudson.tasks.junit.TestResultAction;
 import hudson.tasks.junit.TestResultSummary;
 import hudson.tasks.junit.TrendTestResultSummary;
 import hudson.util.Secret;
+import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
 import java.io.ByteArrayInputStream;
@@ -52,6 +53,7 @@ import static org.junit.Assert.assertNotNull;
 
 public class DatabaseTestResultStorageTest {
 
+    public static final String TEST_IMAGE = "postgres:12-alpine";
     @ClassRule
     public static BuildWatcher buildWatcher = new BuildWatcher();
 
@@ -60,7 +62,7 @@ public class DatabaseTestResultStorageTest {
 
     @Test
     public void smokes() throws Exception {
-        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:12-alpine")) {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
 
             r.createOnlineSlave(Label.get("remote"));
@@ -173,7 +175,138 @@ public class DatabaseTestResultStorageTest {
         }
     }
 
-    private void setupPlugin(PostgreSQLContainer<?> postgres) {
+    @Test
+    public void testResultCleanup() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            r.createOnlineSlave(Label.get("remote"));
+            WorkflowJob p = r.createProject(WorkflowJob.class, "p");
+            p.setDefinition(new CpsFlowDefinition(
+                    "node('remote') {\n" +
+                            "  writeFile file: 'x.xml', text: '''<testsuite name='sweet' time='200.0'>" +
+                            "<testcase classname='Klazz' name='test1' time='198.0'><error message='failure'/></testcase>" +
+                            "<testcase classname='Klazz' name='test2' time='2.0'/>" +
+                            "<testcase classname='other.Klazz' name='test3'><skipped message='Not actually run.'/></testcase>" +
+                            "</testsuite>'''\n" +
+                            "  def s = junit 'x.xml'\n" +
+                            "  echo(/summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
+                            "  writeFile file: 'x.xml', text: '''<testsuite name='supersweet'>" +
+                            "<testcase classname='another.Klazz' name='test1'><error message='another failure'/></testcase>" +
+                            "</testsuite>'''\n" +
+                            "  s = junit 'x.xml'\n" +
+                            "  echo(/next summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
+                            "}", true));
+
+            WorkflowRun b = p.scheduleBuild2(0).get();
+            r.assertBuildStatus(Result.UNSTABLE, b);
+
+            b = p.scheduleBuild2(0).get();
+            r.assertBuildStatus(Result.UNSTABLE, b);
+
+            b = p.scheduleBuild2(0).get();
+            r.assertBuildStatus(Result.UNSTABLE, b);
+
+            // 3 sets of test results
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT count(*) FROM caseResults");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                int anInt = result.getInt(1);
+                assertThat(anInt, is(12));
+            }
+
+            b.delete();
+
+            // 2 sets of test results
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT count(*) FROM caseResults");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                int anInt = result.getInt(1);
+                assertThat(anInt, is(8));
+            }
+
+            p.delete();
+
+            // 0 test results
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT count(*) FROM caseResults");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                int anInt = result.getInt(1);
+                assertThat(anInt, is(0));
+            }
+        }
+    }
+
+    @Test
+    public void testResultCleanup_skipped_if_disabled() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            storage.setSkipCleanupRunsOnDeletion(true);
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+
+            r.createOnlineSlave(Label.get("remote"));
+            WorkflowJob p = r.createProject(WorkflowJob.class, "p");
+            p.setDefinition(new CpsFlowDefinition(
+                    "node('remote') {\n" +
+                            "  writeFile file: 'x.xml', text: '''<testsuite name='sweet' time='200.0'>" +
+                            "<testcase classname='Klazz' name='test1' time='198.0'><error message='failure'/></testcase>" +
+                            "<testcase classname='Klazz' name='test2' time='2.0'/>" +
+                            "<testcase classname='other.Klazz' name='test3'><skipped message='Not actually run.'/></testcase>" +
+                            "</testsuite>'''\n" +
+                            "  def s = junit 'x.xml'\n" +
+                            "  echo(/summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
+                            "  writeFile file: 'x.xml', text: '''<testsuite name='supersweet'>" +
+                            "<testcase classname='another.Klazz' name='test1'><error message='another failure'/></testcase>" +
+                            "</testsuite>'''\n" +
+                            "  s = junit 'x.xml'\n" +
+                            "  echo(/next summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
+                            "}", true));
+
+            WorkflowRun b = p.scheduleBuild2(0).get();
+            r.assertBuildStatus(Result.UNSTABLE, b);
+
+
+            // 1 sets of test results
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT count(*) FROM caseResults");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                int anInt = result.getInt(1);
+                assertThat(anInt, is(4));
+            }
+
+            b.delete();
+
+            // 1 set of test results
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT count(*) FROM caseResults");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                int anInt = result.getInt(1);
+                assertThat(anInt, is(4));
+            }
+
+            p.delete();
+
+            // 1 set of test results
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT count(*) FROM caseResults");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                int anInt = result.getInt(1);
+                assertThat(anInt, is(4));
+            }
+        }
+    }
+
+
+    private void setupPlugin(PostgreSQLContainer<?> postgres) throws SQLException {
         // comment this out if you hit the below test containers issue
         postgres.start();
             
@@ -184,6 +317,7 @@ public class DatabaseTestResultStorageTest {
         database.setValidationQuery("SELECT 1");
         GlobalDatabaseConfiguration.get().setDatabase(database);
         JunitTestResultStorageConfiguration.get().setStorage(new DatabaseTestResultStorage());
+        DatabaseSchemaLoader.migrateSchema();
     }
 
     // https://gist.github.com/mikbuch/299568988fa7997cb28c7c84309232b1
