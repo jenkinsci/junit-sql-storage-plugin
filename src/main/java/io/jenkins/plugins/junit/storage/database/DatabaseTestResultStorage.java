@@ -3,6 +3,7 @@ package io.jenkins.plugins.junit.storage.database;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
+import hudson.ExtensionList;
 import hudson.Util;
 import hudson.model.Job;
 import hudson.model.Run;
@@ -31,18 +32,23 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.database.Database;
 import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
 import org.jenkinsci.remoting.SerializableOnlyOverRemoting;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
+import org.kohsuke.stapler.StaplerRequest;
 
 
 @Extension
 public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
     private transient ConnectionSupplier connectionSupplier;
+
+    private boolean skipCleanupRunsOnDeletion;
 
     @DataBoundConstructor
     public DatabaseTestResultStorage() {}
@@ -52,6 +58,15 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             connectionSupplier = new LocalConnectionSupplier();
         }
         return connectionSupplier;
+    }
+
+    public boolean isSkipCleanupRunsOnDeletion() {
+        return skipCleanupRunsOnDeletion;
+    }
+
+    @DataBoundSetter
+    public void setSkipCleanupRunsOnDeletion(boolean skipCleanupRunsOnDeletion) {
+        this.skipCleanupRunsOnDeletion = skipCleanupRunsOnDeletion;
     }
 
     @Override public RemotePublisher createRemotePublisher(Run<?, ?> build) throws IOException {
@@ -266,6 +281,34 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         return results;
                     }
                 }
+            });
+        }
+
+
+        public Void deleteRun() {
+            return query(connection -> {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "DELETE FROM caseResults WHERE job = ? AND build = ?"
+                )) {
+                    statement.setString(1, job);
+                    statement.setInt(2, build);
+
+                    statement.execute();
+                }
+                return null;
+            });
+        }
+
+        public Void deleteJob() {
+            return query(connection -> {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "DELETE FROM caseResults WHERE job = ?"
+                )) {
+                    statement.setString(1, job);
+
+                    statement.execute();
+                }
+                return null;
             });
         }
 
