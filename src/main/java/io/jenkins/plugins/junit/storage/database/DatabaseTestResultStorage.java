@@ -32,7 +32,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import jenkins.model.Jenkins;
-import net.sf.json.JSONObject;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.database.Database;
@@ -40,8 +39,6 @@ import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
 import org.jenkinsci.remoting.SerializableOnlyOverRemoting;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
-import org.kohsuke.stapler.StaplerRequest;
-
 
 @Extension
 public class DatabaseTestResultStorage extends JunitTestResultStorage {
@@ -112,7 +109,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         @Override public void publish(TestResult result, TaskListener listener) throws IOException {
             try {
-                try (PreparedStatement statement = connectionSupplier.connection().prepareStatement("INSERT INTO caseResults (job, build, suite, package, className, testName, errorDetails, skipped, duration, stdout, stderr, stacktrace) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                try (Connection connection = connectionSupplier.connection(); PreparedStatement statement = connection.prepareStatement("INSERT INTO caseResults (job, build, suite, package, className, testName, errorDetails, skipped, duration, stdout, stderr, stacktrace) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
                     int count = 0;
                     for (SuiteResult suiteResult : result.getSuites()) {
                         for (CaseResult caseResult : suiteResult.getCases()) {
@@ -162,7 +159,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
     }
 
-    static abstract class ConnectionSupplier { // TODO AutoCloseable
+    static abstract class ConnectionSupplier implements AutoCloseable {
 
         private transient Connection connection;
 
@@ -171,12 +168,24 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         protected void initialize(Connection connection) throws SQLException {}
 
         synchronized Connection connection() throws SQLException {
-            if (connection == null) {
+            if (connection == null || connection.isClosed()) {
                 Connection _connection = database().getDataSource().getConnection();
                 initialize(_connection);
                 connection = _connection;
             }
             return connection;
+        }
+
+        @Override
+        public void close() {
+            try {
+                if (connection != null) {
+                    connection.close();
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+            connection = null;
         }
 
     }
@@ -221,8 +230,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         private <T> T query(Querier<T> querier) {
-            try {
-                Connection connection = getConnectionSupplier().connection();
+            try (Connection connection = getConnectionSupplier().connection()) {
                 return querier.run(connection);
             } catch (SQLException x) {
                 throw new RuntimeException(x);
