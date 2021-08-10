@@ -173,7 +173,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 initialize(_connection);
                 connection = _connection;
             }
-            assert !connection.isClosed();
             return connection;
         }
 
@@ -232,7 +231,10 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         private <T> T query(Querier<T> querier) {
             try {
-                return querier.run(getConnectionSupplier().connection()); // TODO fix connection closing
+                // TODO move to try-with-resources, whenever I try close this I get (multiple queries needed):
+                // org.postgresql.util.PSQLException: This statement has been closed.
+                Connection connection = getConnectionSupplier().connection();
+                return querier.run(connection);
             } catch (SQLException x) {
                 throw new RuntimeException(x);
             }
