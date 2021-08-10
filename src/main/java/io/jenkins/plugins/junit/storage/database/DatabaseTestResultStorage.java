@@ -3,7 +3,6 @@ package io.jenkins.plugins.junit.storage.database;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
-import hudson.ExtensionList;
 import hudson.Util;
 import hudson.model.Job;
 import hudson.model.Run;
@@ -16,6 +15,7 @@ import hudson.tasks.junit.TestDurationResultSummary;
 import hudson.tasks.junit.TestResult;
 import hudson.tasks.junit.TestResultSummary;
 import hudson.tasks.junit.TrendTestResultSummary;
+import hudson.tasks.junit.HistoryTestResultSummary;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageDescriptor;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
@@ -230,7 +230,10 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         private <T> T query(Querier<T> querier) {
-            try (Connection connection = getConnectionSupplier().connection()) {
+            try {
+                // TODO move to try-with-resources, whenever I try close this I get (multiple queries needed):
+                // org.postgresql.util.PSQLException: This statement has been closed.
+                Connection connection = getConnectionSupplier().connection();
                 return querier.run(connection);
             } catch (SQLException x) {
                 throw new RuntimeException(x);
@@ -410,6 +413,35 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             testDurationResultSummaries.add(new TestDurationResultSummary(buildNumber, duration));
                         }
                         return testDurationResultSummaries;
+                    }
+                }
+            });
+        }
+
+        public List<HistoryTestResultSummary> getHistorySummary(int offset) {
+            return query(connection -> {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "SELECT build, sum(duration) as duration, sum(case when errorDetails is not null then 1 else 0 end) as failCount, sum(case when skipped is not null then 1 else 0 end) as skipCount, sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount FROM caseResults WHERE job = ? GROUP BY build ORDER BY build DESC LIMIT 25 OFFSET ?;"
+                )) {
+                    statement.setString(1, job);
+                    statement.setInt(2, offset);
+                    try (ResultSet result = statement.executeQuery()) {
+
+                        List<HistoryTestResultSummary> historyTestResultSummaries = new ArrayList<>();
+                        while (result.next()) {
+                            int buildNumber = result.getInt("build");
+                            int duration = result.getInt("duration");
+                            int passed = result.getInt("passCount");
+                            int failed = result.getInt("failCount");
+                            int skipped = result.getInt("skipCount");
+
+                            Job<?, ?> theJob = Jenkins.get().getItemByFullName(getJobName(), Job.class);
+                            if (theJob != null) {
+                                Run<?, ?> run = theJob.getBuildByNumber(buildNumber);
+                                historyTestResultSummaries.add(new HistoryTestResultSummary(run, duration, failed, skipped, passed));
+                            }
+                        }
+                        return historyTestResultSummaries;
                     }
                 }
             });
