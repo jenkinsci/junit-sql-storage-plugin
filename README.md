@@ -1,4 +1,4 @@
-# Junit SQL Storage Plugin
+# JUnit SQL Storage Plugin
 
 [![Build Status](https://ci.jenkins.io/job/Plugins/job/junit-sql-storage-plugin/job/master/badge/icon)](https://ci.jenkins.io/job/Plugins/job/junit-sql-storage-plugin/job/master/)
 [![Contributors](https://img.shields.io/github/contributors/jenkinsci/junit-sql-storage-plugin.svg)](https://github.com/jenkinsci/junit-sql-storage-plugin/graphs/contributors)
@@ -8,7 +8,7 @@
 
 ## Introduction
 
-Implements the pluggable storage API for the [Junit plugin](https://plugins.jenkins.io/junit/).
+Implements the pluggable storage API for the [JUnit plugin](https://plugins.jenkins.io/junit/).
 
 In common CI/CD use-cases a lot of the space is consumed by test reports. 
 This data is stored within JENKINS_HOME, and the current storage format requires huge overheads when retrieving statistics and, especially trends. 
@@ -34,13 +34,13 @@ Manage Jenkins → Configure System → Junit
 
 In the dropdown select 'SQL Database'
 
-![Junit SQL plugin configuration](images/junit-sql-config-screen.png)
+![JUnit SQL plugin configuration](images/junit-sql-config-screen.png)
 
 Manage Jenkins → Configure System → Global Database
 
 Select the database implementation you want to use and click 'Test Connection' to verify Jenkins can connect
 
-![Junit SQL plugin database configuration](images/junit-sql-database-config.png)
+![JUnit SQL plugin database configuration](images/junit-sql-database-config.png)
 
 Click 'Save'
 
