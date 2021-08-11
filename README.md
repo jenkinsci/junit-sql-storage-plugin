@@ -14,29 +14,29 @@ In common CI/CD use-cases a lot of the space is consumed by test reports.
 This data is stored within JENKINS_HOME, and the current storage format requires huge overheads when retrieving statistics and, especially trends. 
 In order to display trends, each report has to be loaded and then processed in-memory.
 
-The main purpose of externalising Test Results is to optimize Jenkins logic by querying the desired data from specialized external storage.
+The main purpose of externalising Test Results is to optimize Jenkins performance by querying the desired data from external storage.
 
-This plugin adds a SQL extension, any database should work although we're only currently testing against PostgreSQL.
+This plugin adds a SQL extension, we currently support PostgreSQL and MySQL, others can be added, create an issue or send a pull request.
 
 Tables will be automatically created.
 
 ## Getting started
 
-Install your database vendor specific plugin, you can use the Jenkins plugin manager to search for it:
+Install your database vendor specific plugin, you can use the Jenkins plugin site to search for it:
 
-`${JENKINS_URL}/pluginManager/available?filter=Database`
+https://plugins.jenkins.io/ui/search/?labels=database
 
 e.g. you could install the [PostgreSQL Database](https://plugins.jenkins.io/database-postgresql/) plugin.
 
 ### UI
 
-Manage Jenkins => Configure System => Junit
+Manage Jenkins → Configure System → Junit
 
 In the dropdown select 'SQL Database'
 
 ![Junit SQL plugin configuration](images/junit-sql-config-screen.png)
 
-Manage Jenkins => Configure System => Global Database
+Manage Jenkins → Configure System → Global Database
 
 Select the database implementation you want to use and click 'Test Connection' to verify Jenkins can connect
 
