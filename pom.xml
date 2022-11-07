@@ -47,7 +47,7 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>database</artifactId>
-            <version>128.vaa83e142f7f2</version>
+            <version>166.vf8eb_e4c80a_5d</version>
         </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>
