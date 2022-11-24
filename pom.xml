@@ -4,7 +4,7 @@
     <parent>
         <groupId>org.jenkins-ci.plugins</groupId>
         <artifactId>plugin</artifactId>
-        <version>4.50</version>
+        <version>4.51</version>
         <relativePath />
     </parent>
     <groupId>io.jenkins.plugins</groupId>
@@ -14,7 +14,7 @@
     <properties>
         <changelist>999999-SNAPSHOT</changelist>
         <gitHubRepo>jenkinsci/junit-sql-storage-plugin</gitHubRepo>
-        <jenkins.version>2.289.1</jenkins.version>
+        <jenkins.version>2.346.3</jenkins.version>
         <useBeta>true</useBeta>
     </properties>
     <name>Junit SQL Storage Plugin</name>
@@ -25,8 +25,8 @@
         <dependencies>
             <dependency>
                 <groupId>io.jenkins.tools.bom</groupId>
-                <artifactId>bom-2.289.x</artifactId>
-                <version>1117.v62a_f6a_01de98</version>
+                <artifactId>bom-2.346.x</artifactId>
+                <version>1706.vc166d5f429f8</version>
                 <scope>import</scope>
                 <type>pom</type>
             </dependency>
@@ -42,7 +42,7 @@
             </dependency>
         </dependencies>
     </dependencyManagement>
-    
+
     <dependencies>
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
@@ -63,7 +63,7 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>junit</artifactId>
-            <version>1.53</version>
+            <version>1166.v2936b_5c7cb_e1</version>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins.workflow</groupId>

@@ -119,6 +119,7 @@ public class DatabaseTestResultStorageTest {
                 assertEquals(1, a.getResult().getSkipCount());
                 assertEquals(4, a.getResult().getTotalCount());
                 assertEquals(1, a.getResult().getPassCount());
+                assertEquals(2, a.getResult().getSuites().size());
                 List<CaseResult> failedTests = a.getFailedTests();
                 assertEquals(2, failedTests.size());
                 final CaseResult klazzTest1 = failedTests.get(0);
@@ -309,9 +310,9 @@ public class DatabaseTestResultStorageTest {
     private void setupPlugin(PostgreSQLContainer<?> postgres) throws SQLException {
         // comment this out if you hit the below test containers issue
         postgres.start();
-            
+
         PostgreSQLDatabase database = new PostgreSQLDatabase(postgres.getHost() + ":" + postgres.getMappedPort(5432), postgres.getDatabaseName(), postgres.getUsername(), Secret.fromString(postgres.getPassword()), null);
-//        Use the below if test containers doesn't work for you, i.e. MacOS edge release of docker broken Sep 2020 
+//        Use the below if test containers doesn't work for you, i.e. MacOS edge release of docker broken Sep 2020
 //        https://github.com/testcontainers/testcontainers-java/issues/3166
 //        PostgreSQLDatabase database = new PostgreSQLDatabase("localhost", "postgres", "postgres", Secret.fromString("postgres"), null);
         database.setValidationQuery("SELECT 1");
