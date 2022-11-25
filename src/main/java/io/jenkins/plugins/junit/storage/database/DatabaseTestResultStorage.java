@@ -25,12 +25,8 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
+
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
@@ -666,6 +662,49 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 }
             });
 
+        }
+
+        @Override
+        public Collection<SuiteResult> getSuites() {
+            return query(connection -> {
+                try (PreparedStatement statement = connection.prepareStatement("SELECT suite, testname, package, classname, errordetails, skipped, duration, stdout, stderr, stacktrace FROM caseResults WHERE job = ? AND build = ? ORDER BY suite")) {
+                    statement.setString(1, job);
+                    statement.setInt(2, build);
+                    List<SuiteResult> suiteResults = new ArrayList<SuiteResult>();
+                    try (ResultSet result = statement.executeQuery()) {
+                        TestResult parent = new TestResult(this);
+                        SuiteResult suiteResult = null;
+                        boolean isFirstRow = true;
+                        while (result.next()) {
+                            String thisSuiteName = result.getString("suite");
+                            if (isFirstRow || !StringUtils.equals(suiteResult.getName(), thisSuiteName)) {
+                                suiteResult = new SuiteResult(thisSuiteName, null, null, null);
+                                suiteResults.add(suiteResult);
+                                isFirstRow = false;
+                            }
+                            String resultTestName = result.getString("testname");
+                            String errorDetails = result.getString("errordetails");
+                            String packageName = result.getString("package");
+                            String className = result.getString("classname");
+                            String skipped = result.getString("skipped");
+                            String stdout = result.getString("stdout");
+                            String stderr = result.getString("stderr");
+                            String stacktrace = result.getString("stacktrace");
+                            float duration = result.getFloat("duration");
+
+                            suiteResult.setParent(parent);
+                            CaseResult caseResult = new CaseResult(suiteResult, className, resultTestName, errorDetails, skipped, duration, stdout, stderr, stacktrace);
+                            final PackageResult packageResult = new PackageResult(parent, packageName);
+                            packageResult.add(caseResult);
+                            ClassResult classResult = new ClassResult(packageResult, className);
+                            classResult.add(caseResult);
+                            caseResult.setClass(classResult);
+                            suiteResult.addCase(caseResult);
+                        }
+                        return suiteResults;
+                    }
+                }
+            });
         }
 
         @Override
