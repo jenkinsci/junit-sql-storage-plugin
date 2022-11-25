@@ -5,6 +5,7 @@ import hudson.model.Label;
 import hudson.model.Result;
 import hudson.tasks.junit.CaseResult;
 import hudson.tasks.junit.PackageResult;
+import hudson.tasks.junit.SuiteResult;
 import hudson.tasks.junit.TestDurationResultSummary;
 import hudson.tasks.junit.TestResultAction;
 import hudson.tasks.junit.TestResultSummary;
@@ -21,6 +22,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
@@ -44,7 +46,9 @@ import org.w3c.dom.NodeList;
 
 import static java.util.Objects.requireNonNull;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasProperty;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.core.Is.is;
 import static org.junit.Assert.assertEquals;
@@ -172,6 +176,21 @@ public class DatabaseTestResultStorageTest {
 
                 final List<TestDurationResultSummary> testDurationResultSummary = pluggableStorage.getTestDurationResultSummary();
                 assertThat(testDurationResultSummary.get(0).getDuration(), is(200));
+
+                //check storage getSuites method
+                Collection<SuiteResult> suiteResults = pluggableStorage.getSuites();
+                assertThat(suiteResults, hasSize(2));
+                //check the two suites name
+                assertThat(suiteResults, containsInAnyOrder(hasProperty("name", equalTo("supersweet")), hasProperty("name", equalTo("sweet"))));
+
+                //check one suite detail
+                SuiteResult supersweetSuite = suiteResults.stream()
+                        .filter(suite -> suite.getName().equals("supersweet"))
+                        .findFirst()
+                        .get();
+                assertThat(supersweetSuite.getCases(), hasSize(1));
+                assertThat(supersweetSuite.getCases().get(0).getName(), equalTo("test1"));
+                assertThat(supersweetSuite.getCases().get(0).getClassName(), equalTo("another.Klazz"));
             }
         }
     }
