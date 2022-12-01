@@ -3,6 +3,7 @@ package io.jenkins.plugins.junit.storage.database;
 import com.google.common.collect.ImmutableSet;
 import hudson.model.Label;
 import hudson.model.Result;
+import hudson.slaves.DumbSlave;
 import hudson.tasks.junit.CaseResult;
 import hudson.tasks.junit.PackageResult;
 import hudson.tasks.junit.SuiteResult;
@@ -11,11 +12,11 @@ import hudson.tasks.junit.TestResultAction;
 import hudson.tasks.junit.TestResultSummary;
 import hudson.tasks.junit.TrendTestResultSummary;
 import hudson.util.Secret;
-import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -44,6 +45,8 @@ import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
+import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_ERROR_DETAILS_LENGTH;
+import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_SUITE_LENGTH;
 import static java.util.Objects.requireNonNull;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
@@ -322,6 +325,61 @@ public class DatabaseTestResultStorageTest {
                 int anInt = result.getInt(1);
                 assertThat(anInt, is(4));
             }
+        }
+    }
+
+
+    @Test
+    public void testResult_long_string() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+
+            WorkflowJob p = r.createProject(WorkflowJob.class, "p");
+
+            p.setDefinition(new CpsFlowDefinition(
+                    "node('remote') {\n" +
+                            "  def s = junit 'x.xml'\n" +
+                            "  echo(/summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
+                            "  writeFile file: 'x.xml', text: '''<testsuite name='supersweet'>" +
+                            "<testcase classname='another.Klazz' name='test1'><error message='another failure'/></testcase>" +
+                            "</testsuite>'''\n" +
+                            "  s = junit 'x.xml'\n" +
+                            "  echo(/next summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
+                            "}", true));
+
+            //Because writeFile can't handle long string
+            //We use file copy to prepare the test result
+            DumbSlave agent = r.createOnlineSlave(Label.get("remote"));
+            URI longStringFileUri = DatabaseTestResultStorageTest.class.getResource("long-string.xml").toURI();
+            agent.getWorkspaceFor(p).child("x.xml").copyFrom(longStringFileUri.toURL());
+            WorkflowRun b = p.scheduleBuild2(0).get();
+            r.assertBuildStatus(Result.UNSTABLE, b);
+
+
+            // 1 sets of test results
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT count(*) FROM caseResults");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                int anInt = result.getInt(1);
+                assertThat(anInt, is(4));
+            }
+
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+                 PreparedStatement statement = connection.prepareStatement("SELECT job, build, suite, package, className, testName, errorDetails, skipped, duration, stdout, stderr, stacktrace FROM caseResults where testName='test1'");
+                 ResultSet result = statement.executeQuery()) {
+                result.next();
+                String suiteNameInDatabase = result.getString("suite");
+                assertThat(suiteNameInDatabase.length(), is(MAX_SUITE_LENGTH));
+                String errorDetailsInDatabase = result.getString("errorDetails");
+                assertThat(errorDetailsInDatabase.length(), is(MAX_ERROR_DETAILS_LENGTH));
+            }
+
+
         }
     }
 

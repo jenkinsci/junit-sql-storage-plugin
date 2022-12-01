@@ -39,6 +39,17 @@ import org.kohsuke.stapler.DataBoundSetter;
 @Extension
 public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
+    static final int MAX_JOB_LENGTH = 255;
+    static final int MAX_SUITE_LENGTH = 255;
+    static final int MAX_PACKAGE_LENGTH = 255;
+    static final int MAX_CLASSNAME_LENGTH =255;
+    static final int MAX_TEST_NAME_LENGTH =500;
+    static final int MAX_STDOUT_LENGTH =100000;
+    static final int MAX_STDERR_LENGTH =100000;
+    static final int MAX_STACK_TRACE_LENGTH =100000;
+    static final int MAX_ERROR_DETAILS_LENGTH =100000;
+    static final int MAX_SKIPPED_LENGTH =1000;
+
     private transient ConnectionSupplier connectionSupplier;
 
     private boolean skipCleanupRunsOnDeletion;
@@ -109,36 +120,37 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     int count = 0;
                     for (SuiteResult suiteResult : result.getSuites()) {
                         for (CaseResult caseResult : suiteResult.getCases()) {
-                            statement.setString(1, job);
+                            statement.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
                             statement.setInt(2, build);
-                            statement.setString(3, suiteResult.getName());
-                            statement.setString(4, caseResult.getPackageName());
-                            statement.setString(5, caseResult.getClassName());
-                            statement.setString(6, caseResult.getName());
+                            statement.setString(3, StringUtils.truncate(suiteResult.getName(), MAX_SUITE_LENGTH));
+                            statement.setString(4, StringUtils.truncate(caseResult.getPackageName(), MAX_PACKAGE_LENGTH));
+                            statement.setString(5, StringUtils.truncate(caseResult.getClassName(), MAX_CLASSNAME_LENGTH));
+                            statement.setString(6, StringUtils.truncate(caseResult.getName(), MAX_TEST_NAME_LENGTH));
                             String errorDetails = caseResult.getErrorDetails();
                             if (errorDetails != null) {
+                                errorDetails = StringUtils.truncate(errorDetails, MAX_ERROR_DETAILS_LENGTH);
                                 statement.setString(7, errorDetails);
                             } else {
                                 statement.setNull(7, Types.VARCHAR);
                             }
                             if (caseResult.isSkipped()) {
-                                statement.setString(8, Util.fixNull(caseResult.getSkippedMessage()));
+                                statement.setString(8, StringUtils.truncate(Util.fixNull(caseResult.getSkippedMessage()), MAX_SKIPPED_LENGTH));
                             } else {
                                 statement.setNull(8, Types.VARCHAR);
                             }
                             statement.setFloat(9, caseResult.getDuration());
                             if (StringUtils.isNotEmpty(caseResult.getStdout())) {
-                                statement.setString(10, caseResult.getStdout());
+                                statement.setString(10, StringUtils.truncate(caseResult.getStdout(), MAX_STDOUT_LENGTH));
                             } else {
                                 statement.setNull(10, Types.VARCHAR);
                             }
                             if (StringUtils.isNotEmpty(caseResult.getStderr())) {
-                                statement.setString(11, caseResult.getStderr());
+                                statement.setString(11, StringUtils.truncate(caseResult.getStderr(), MAX_STDERR_LENGTH));
                             } else {
                                 statement.setNull(11, Types.VARCHAR);
                             }
                             if (StringUtils.isNotEmpty(caseResult.getErrorStackTrace())) {
-                                statement.setString(12, caseResult.getErrorStackTrace());
+                                statement.setString(12, StringUtils.truncate(caseResult.getErrorStackTrace(), MAX_STACK_TRACE_LENGTH));
                             } else {
                                 statement.setNull(12, Types.VARCHAR);
                             }
