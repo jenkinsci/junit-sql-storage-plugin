@@ -42,13 +42,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int MAX_JOB_LENGTH = 255;
     static final int MAX_SUITE_LENGTH = 255;
     static final int MAX_PACKAGE_LENGTH = 255;
-    static final int MAX_CLASSNAME_LENGTH =255;
-    static final int MAX_TEST_NAME_LENGTH =500;
-    static final int MAX_STDOUT_LENGTH =100000;
-    static final int MAX_STDERR_LENGTH =100000;
-    static final int MAX_STACK_TRACE_LENGTH =100000;
-    static final int MAX_ERROR_DETAILS_LENGTH =100000;
-    static final int MAX_SKIPPED_LENGTH =1000;
+    static final int MAX_CLASSNAME_LENGTH = 255;
+    static final int MAX_TEST_NAME_LENGTH = 500;
+    static final int MAX_STDOUT_LENGTH = 100000;
+    static final int MAX_STDERR_LENGTH = 100000;
+    static final int MAX_STACK_TRACE_LENGTH = 100000;
+    static final int MAX_ERROR_DETAILS_LENGTH = 100000;
+    static final int MAX_SKIPPED_LENGTH = 1000;
 
     private transient ConnectionSupplier connectionSupplier;
 
