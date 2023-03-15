@@ -4,7 +4,7 @@
     <parent>
         <groupId>org.jenkins-ci.plugins</groupId>
         <artifactId>plugin</artifactId>
-        <version>4.54</version>
+        <version>4.56</version>
         <relativePath />
     </parent>
     <groupId>io.jenkins.plugins</groupId>
@@ -14,18 +14,17 @@
     <properties>
         <changelist>999999-SNAPSHOT</changelist>
         <gitHubRepo>jenkinsci/junit-sql-storage-plugin</gitHubRepo>
-        <jenkins.version>2.361.4</jenkins.version>
+        <jenkins.version>2.387.1</jenkins.version>
         <useBeta>true</useBeta>
     </properties>
     <name>Junit SQL Storage Plugin</name>
-    <description>Provides a pluggable storage extension for the junit plugin with a SQL database</description>
     <url>https://github.com/jenkinsci/${project.artifactId}-plugin</url>
 
     <dependencyManagement>
         <dependencies>
             <dependency>
                 <groupId>io.jenkins.tools.bom</groupId>
-                <artifactId>bom-2.361.x</artifactId>
+                <artifactId>bom-2.387.x</artifactId>
                 <version>1887.vda_d0ddb_c15c4</version>
                 <scope>import</scope>
                 <type>pom</type>
@@ -36,9 +35,8 @@
                 <version>2.18.0</version>
             </dependency>
             <dependency>
-                <groupId>org.apache.commons</groupId>
-                <artifactId>commons-lang3</artifactId>
-                <version>3.12.0</version>
+                <groupId>io.jenkins.plugins</groupId>
+                <artifactId>commons-lang3-api</artifactId>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -47,23 +45,28 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>database</artifactId>
-            <version>128.vaa83e142f7f2</version>
+            <version>191.vd5981b_97a_5fa_</version>
         </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
-            <version>9.6.0</version>
+            <version>9.16.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.fasterxml.jackson.dataformat</groupId>
+                    <artifactId>jackson-dataformat-toml</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>database-postgresql</artifactId>
-            <version>1.2</version>
+            <version>81.v136de0a_08ef9</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>junit</artifactId>
-            <version>1177.v90374a_ef4d09</version>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins.workflow</groupId>
@@ -108,6 +111,10 @@
                 <exclusion>
                     <groupId>org.slf4j</groupId>
                     <artifactId>slf4j-api</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.jetbrains</groupId>
+                    <artifactId>annotations</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>
