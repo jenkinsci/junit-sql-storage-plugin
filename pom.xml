@@ -61,7 +61,7 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>database-postgresql</artifactId>
-            <version>81.v136de0a_08ef9</version>
+            <version>97.v59f57c5a_b_a_b_6</version>
             <scope>test</scope>
         </dependency>
         <dependency>
