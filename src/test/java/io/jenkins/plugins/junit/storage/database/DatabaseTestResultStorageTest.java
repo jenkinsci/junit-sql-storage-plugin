@@ -60,7 +60,7 @@ import static org.junit.Assert.assertNotNull;
 
 public class DatabaseTestResultStorageTest {
 
-    public static final String TEST_IMAGE = "postgres:12-alpine";
+    public static final String TEST_IMAGE = "postgres:16-alpine";
     @ClassRule
     public static BuildWatcher buildWatcher = new BuildWatcher();
 
