@@ -24,8 +24,8 @@
         <dependencies>
             <dependency>
                 <groupId>io.jenkins.tools.bom</groupId>
-                <artifactId>bom-2.401.x</artifactId>
-                <version>2745.vc7b_fe4c876fa_</version>
+                <artifactId>bom-2.414.x</artifactId>
+                <version>2805.v4398b_43dfc18</version>
                 <scope>import</scope>
                 <type>pom</type>
             </dependency>
@@ -49,7 +49,6 @@
         <dependency>
             <groupId>io.jenkins.plugins</groupId>
             <artifactId>flyway-api</artifactId>
-            <version>9.22.3-59.v256230cf4a_09</version>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
