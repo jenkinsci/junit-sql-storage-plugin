@@ -19,19 +19,15 @@ public class TestResultCleanupListener {
             if (junitTestResultStorage instanceof FileJunitTestResultStorage) {
                 return;
             }
-
             if (junitTestResultStorage instanceof DatabaseTestResultStorage) {
                 DatabaseTestResultStorage storage = (DatabaseTestResultStorage) junitTestResultStorage;
                 if (storage.isSkipCleanupRunsOnDeletion()) {
                     return;
                 }
             }
-
             TestResultImpl testResult = junitTestResultStorage.load(run.getParent().getFullName(), run.getNumber());
-
             if (testResult instanceof DatabaseTestResultStorage.TestResultStorage) {
                 DatabaseTestResultStorage.TestResultStorage storage = (DatabaseTestResultStorage.TestResultStorage) testResult;
-
                 storage.deleteRun();
             }
         }
@@ -45,16 +41,13 @@ public class TestResultCleanupListener {
             if (junitTestResultStorage instanceof FileJunitTestResultStorage) {
                 return;
             }
-
             if (junitTestResultStorage instanceof DatabaseTestResultStorage) {
                 DatabaseTestResultStorage storage = (DatabaseTestResultStorage) junitTestResultStorage;
                 if (storage.isSkipCleanupRunsOnDeletion()) {
                     return;
                 }
             }
-
             TestResultImpl testResult = junitTestResultStorage.load(item.getFullName(), 0);
-
             if (testResult instanceof DatabaseTestResultStorage.TestResultStorage) {
                 DatabaseTestResultStorage.TestResultStorage storage = (DatabaseTestResultStorage.TestResultStorage) testResult;
                 storage.deleteJob();

@@ -8,3 +8,22 @@ services:
       POSTGRES_PASSWORD: postgres
     ports:
       - 5432:5432
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - "4317:4317"
+      - "16686:16686"
+
+  jenkins:
+    image: jenkins
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: jenkins
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      OTEL_JAVAAGENT_LOGGING: simple
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
