@@ -15,5 +15,8 @@ unclassified:
     endpoint: "http://jaeger:4317"
     exportOtelConfigurationAsEnvironmentVariables: false
     ignoredSteps: "dir,echo,isUnix,pwd,properties"
+    observabilityBackends:
+      - jaeger:
+          jaegerBaseUrl: "http://localhost:16686/"
     serviceName: "jenkins"
     serviceNamespace: "jenkins"

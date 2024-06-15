@@ -28,9 +28,9 @@ Use the following steps if you want to build and install the plugin from source.
 
 ### Building
 
-To build the plugin use the `compile` goal
+To build the plugin use the `package` goal
 ```
-$ mvn clean compile
+$ mvn clean package -P quick-build
 ```
 to run the tests use the `test` goal
 ```
@@ -115,7 +115,7 @@ server and your plugin changes.
 You can also query the postgres database by connecting to the `db` container.
 
 ```
-$ docker exec -it junit-sql-storage-plugin-db-1 psql -U postgres
+$ docker compose exec db psql -U postgres
 psql (16.3 (Debian 16.3-1.pgdg120+1))
 Type "help" for help.
 
