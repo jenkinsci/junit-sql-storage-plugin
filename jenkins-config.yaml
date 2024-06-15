@@ -1,0 +1,22 @@
+unclassified:
+  globalDatabaseConfiguration:
+    database:
+      postgreSQL:
+        database: postgres
+        hostname: db
+        password: postgres
+        username: postgres
+        validationQuery: "SELECT 1"
+  junitTestResultStorage:
+    storage: "database"
+  openTelemetry:
+    authentication: "noAuthentication"
+    disabledResourceProviders: "io.opentelemetry.instrumentation.resources.ProcessResourceProvider"
+    endpoint: "http://jaeger:4317"
+    exportOtelConfigurationAsEnvironmentVariables: false
+    ignoredSteps: "dir,echo,isUnix,pwd,properties"
+    observabilityBackends:
+      - jaeger:
+          jaegerBaseUrl: "http://localhost:16686/"
+    serviceName: "jenkins"
+    serviceNamespace: "jenkins"

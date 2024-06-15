@@ -22,13 +22,47 @@ Tables will be automatically created.
 
 ## Getting started
 
-Install your database vendor specific plugin, you can use the Jenkins plugin site to search for it:
+To install the plugin login to Jenkins → Manage Jenkins → Manage Plugins → Available → Search for 'JUnit SQL Storage' → Install.
+
+Use the following steps if you want to build and install the plugin from source.
+
+### Building
+
+To build the plugin use the `package` goal
+```
+$ mvn clean package -P quick-build
+```
+to run the tests use the `test` goal
+```
+$ mvn clean test
+```
+
+### Deploying Jenkins and the plugin
+
+To try out your changes you can deploy Jenkins using the `deploy.sh` file provided in the repository.
+```
+$ ./deploy.sh
+```
+This will compile the junit-sql-storage plugin (.hpi file), build a docker image of Jenkins with the compiled 
+junit-sql-storage plugin installed, then deploy the docker swarm of jaeger, postgresql, and Jenkins. 
+
+### UI
+
+You can also use the Jenkins UI to install the plugin and configure it.
+
+### Installing Compiled Plugin
+
+Once you've compiled the plugin (see above) you can install it from the Jenkins UI. Go to 'Manage Jenkins' → 'Plugins' 
+→ 'Advanced' → 'Deploy' → 'Choose File' → 'Deploy'
+
+<img alt="Install hpi plugin file" src="images/install-junit-sql-storage-plugin.png" width="800">
+
+Next, install your database vendor specific plugin, you can use the Jenkins plugin site to search for it:
 
 https://plugins.jenkins.io/ui/search/?labels=database
 
-e.g. you could install the [PostgreSQL Database](https://plugins.jenkins.io/database-postgresql/) plugin.
-
-### UI
+e.g. you could install the [PostgreSQL Database](https://plugins.jenkins.io/database-postgresql/) plugin or the 
+[MySQL Database](https://plugins.jenkins.io/database-mysql/) plugin.
 
 Manage Jenkins → Configure System → Junit
 
@@ -42,9 +76,14 @@ Select the database implementation you want to use and click 'Test Connection' t
 
 ![JUnit SQL plugin database configuration](images/junit-sql-database-config.png)
 
+> **Note:** use `db` as the 'Host Name' if running Jenkins from inside a docker container as part of the 
+> docker-compose.yaml deployment
+
 Click 'Save'
 
 ### Configuration as code
+
+You can also configure the plugin using the [Configuration as Code](https://plugins.jenkins.io/configuration-as-code/) plugin.
 
 ```yaml
 unclassified:
@@ -58,6 +97,38 @@ unclassified:
         validationQuery: "SELECT 1"
   junitTestResultStorage:
     storage: "database"
+```
+
+Here's an example of how to use it
+
+```
+java -jar java-cli.jar -s http://<host.domain.name>:8080 -auth admin:<api_token> apply-configuration < junit-sql-storage-plugin-config.yml
+```
+
+### Accessing Jaeger
+
+You can access the Jaeger UI by going to `http://localhost:16686`, here you can view the performance of the Jenkins 
+server and your plugin changes.
+
+### Accessing the database
+
+You can also query the postgres database by connecting to the `db` container.
+
+```
+$ docker compose exec db psql -U postgres
+psql (16.3 (Debian 16.3-1.pgdg120+1))
+Type "help" for help.
+
+postgres=# SELECT * FROM caseResults LIMIT 2;
+    job     | build |                           suite                            |                  package                  |                         classname                          |         testname         | errordetails | skipped | duration | stdout | stderr | st
+acktrace |         timestamp
+------------+-------+------------------------------------------------------------+-------------------------------------------+------------------------------------------------------------+--------------------------+--------------+---------+----------+--------+--------+---
+---------+----------------------------
+ xxxx-xxxxx |     1 | xxx.xxxx.xxx.xxxx.xxxxxx.xxxxxxxxxxxxxxxxxxxxxxxx          | xxx.xxxx.xxx.xxxx.xxxxxx                  | xxx.xxxx.xxx.xxxx.xxxxxx.xxxxxxxxxxxxxxxxxxxxxxxx          | xxxxxxxxxxxxxxxxxxxxxxxx |              |         |    0.331 |        |        |
+         | 2024-06-13 18:18:26.897532
+ xxxx-xxxxx |     1 | xxx.xxxx.xxx.xxxxxxxxx.xxxxxxx.xxxxxxxxxx.xxxxxxxxxxxxxxxx | xxx.xxxx.xxx.xxxxxxxxx.xxxxxxx.xxxxxxxxxx | xxx.xxxx.xxx.xxxxxxxxx.xxxxxxx.xxxxxxxxxx.xxxxxxxxxxxxxxxx | xxxxxxxxxxxxxxxxxx       |              |         |    0.292 |        |        |
+         | 2024-06-13 18:18:26.897532
+(2 rows)
 ```
 
 ## Contributing
