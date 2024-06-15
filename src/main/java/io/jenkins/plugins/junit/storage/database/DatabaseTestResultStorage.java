@@ -1,24 +1,5 @@
 package io.jenkins.plugins.junit.storage.database;
 
-import java.io.IOException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Types;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
-import java.util.function.Supplier;
-import java.util.logging.Logger;
-import java.util.stream.Collectors;
-
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalCause;
@@ -41,15 +22,40 @@ import hudson.tasks.junit.TrendTestResultSummary;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageDescriptor;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
+import io.jenkins.plugins.junit.storage.database.otel.OtelInformation;
+import io.jenkins.plugins.opentelemetry.job.action.BuildStepMonitoringAction;
+import io.jenkins.plugins.opentelemetry.job.action.FlowNodeMonitoringAction;
 import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanBuilder;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.database.Database;
 import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
+import org.jenkinsci.plugins.workflow.flow.FlowExecution;
+import org.jenkinsci.plugins.workflow.graph.FlowNode;
+import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.jenkinsci.remoting.SerializableOnlyOverRemoting;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -111,7 +117,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     }
 
     @Override
-    public RemotePublisher createRemotePublisher(Run<?, ?> build) throws IOException {
+    public RemotePublisher createRemotePublisher(Run<?, ?> build, String flowNodeId) throws IOException {
         try {
             log.config("createRemotePublisher() -> calling getConnectionSupplier().connection() for build "
                     + build.getParent().getFullName() + " #" + build.getNumber());
@@ -119,7 +125,63 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         } catch (SQLException x) {
             throw new IOException(x);
         }
-        return new RemotePublisherImpl(build.getParent().getFullName(), build.getNumber());
+        try {
+            OtelInformation otelInformation = getOtelInformation(build, flowNodeId);
+            return new RemotePublisherImpl(build.getParent().getFullName(), build.getNumber(), otelInformation);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static OtelInformation getOtelInformation(Run<?, ?> build, String flowNodeId) throws IOException, InterruptedException {
+        if (build instanceof WorkflowRun) {
+            WorkflowRun run = (WorkflowRun) build;
+            FlowExecution execution = run.getExecution();
+            FlowNodeMonitoringAction action = getFlowNodeMonitoringAction(execution, flowNodeId);
+            if (action != null) {
+                return new OtelInformation(
+                        action.getTraceId(),
+                        action.getW3cTraceContext().get("traceparent"),
+                        action.getSpanId(),
+                        build.getParent().getFullName(),
+                        build.getNumber()
+                );
+            }
+
+        }
+
+        BuildStepMonitoringAction otelAction = build.getAllActions()
+                .stream()
+                .filter(action -> action instanceof BuildStepMonitoringAction
+                        && ((BuildStepMonitoringAction) action).getSpanName().equals("JUnitResultArchiver"))
+                .map(action -> (BuildStepMonitoringAction) action)
+                .findFirst()
+                .orElse(null);
+
+        if (otelAction != null) {
+            return new OtelInformation(
+                    otelAction.getTraceId(),
+                    otelAction.getW3cTraceContext().get("traceparent"),
+                    otelAction.getSpanId(),
+                    build.getParent().getFullName(),
+                    build.getNumber()
+            );
+        }
+
+        return null;
+    }
+
+    private static FlowNodeMonitoringAction getFlowNodeMonitoringAction(FlowExecution execution, String flowNodeId) throws IOException {
+        if (execution == null) {
+            return null;
+        }
+        FlowNode node = execution.getNode(flowNodeId);
+
+        if (node == null) {
+            return null;
+        }
+
+        return node.getAction(FlowNodeMonitoringAction.class);
     }
 
     @Extension
@@ -147,18 +209,20 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         private final String job;
         private final int build;
+        private final OtelInformation otelInformation;
         // TODO keep the same supplier and thus Connection open across builds, so long as the database config remains unchanged
         private final ConnectionSupplier connectionSupplier;
 
-        RemotePublisherImpl(String job, int build) {
+        RemotePublisherImpl(String job, int build, OtelInformation otelInformation) {
             this.job = job;
             this.build = build;
+            this.otelInformation = otelInformation;
             connectionSupplier = new RemoteConnectionSupplier();
         }
 
         @Override
         public void publish(TestResult result, TaskListener listener) throws IOException {
-            var publishSpan = createSpan("DatabaseTestResultStorage.RemotePublisherImpl.publish");
+            var publishSpan = createSpan("DatabaseTestResultStorage.RemotePublisherImpl.publish", otelInformation);
             var sql = "INSERT INTO caseResults (job, "
                     + "build, suite, package, className, testName, errorDetails, skipped, duration, stdout, "
                     + "stderr, stacktrace) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
@@ -395,7 +459,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 classResults.values().forEach(ClassResult::tally);
                             }
                         }
-                        log.info(String.format("Loaded %d test cases from database for '%s #%d'.", results.size(), job,
+                        log.fine(String.format("Loaded %d test cases from database for '%s #%d'.", results.size(), job,
                                 build));
                         return results;
                     }));
@@ -403,7 +467,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         void deleteRun() {
             withSpan("DatabaseTestResultStorage.TestResultStorage.deleteRun", span -> {
-                log.info(String.format("Deleting test results and purging the cache for job %s #%d", job, build));
+                log.fine(String.format("Deleting test results and purging the cache for job %s #%d", job, build));
                 var cacheKey = getCacheKey();
                 caseResultsCache.invalidate(cacheKey);
                 packageResultsCache.invalidate(cacheKey);
@@ -874,9 +938,19 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     }
 
     private static Span createSpan(String spanName) {
-        Span span = getTracer()
-                .spanBuilder(spanName)
-                .startSpan();
+        return createSpan(spanName, null);
+    }
+
+    private static Span createSpan(String spanName, OtelInformation otelInformation) {
+        Tracer tracer = getTracer();
+        SpanBuilder spanBuilder = tracer.spanBuilder(spanName);
+
+        if (otelInformation != null) {
+            spanBuilder = spanBuilder.setParent(otelInformation.setup())
+                    .setAllAttributes(otelInformation.getAttributes());
+        }
+
+        Span span = spanBuilder.startSpan();
         span.setAttribute("java.package", DatabaseTestResultStorage.class.getPackageName());
         return span;
     }
