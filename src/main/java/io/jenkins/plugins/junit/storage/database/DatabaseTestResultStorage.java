@@ -23,12 +23,12 @@ import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageDescriptor;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
 import io.opentelemetry.api.GlobalOpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.instrumentation.jdbc.datasource.JdbcTelemetry;
 import io.opentelemetry.instrumentation.jdbc.datasource.OpenTelemetryDataSource;
+import io.opentelemetry.semconv.incubating.DbIncubatingAttributes;
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
@@ -921,9 +921,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     }
 
     private static void addSqlAttribute(Span span, String sql) {
-        // `db.query.text` not yet in `DbIncubatingAttributes` of opentelemetry-semconv-incubating:1.25 so
-        // manually declare it
-        span.setAttribute(AttributeKey.stringKey("db.query.text"), sql);
+        span.setAttribute(DbIncubatingAttributes.DB_STATEMENT, sql);
     }
 
     private static void addPackageAttribute(Span span, String packageName) {
