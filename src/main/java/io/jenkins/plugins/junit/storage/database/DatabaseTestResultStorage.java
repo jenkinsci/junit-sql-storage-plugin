@@ -1,24 +1,5 @@
 package io.jenkins.plugins.junit.storage.database;
 
-import java.io.IOException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Types;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
-import java.util.function.Supplier;
-import java.util.logging.Logger;
-import java.util.stream.Collectors;
-
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalCause;
@@ -42,9 +23,12 @@ import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageDescriptor;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
 import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
+import io.opentelemetry.instrumentation.jdbc.datasource.JdbcTelemetry;
+import io.opentelemetry.instrumentation.jdbc.datasource.OpenTelemetryDataSource;
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
@@ -53,6 +37,26 @@ import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
 import org.jenkinsci.remoting.SerializableOnlyOverRemoting;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
+
+import javax.sql.DataSource;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 @Extension
 public class DatabaseTestResultStorage extends JunitTestResultStorage {
@@ -275,11 +279,28 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
     }
 
+    static class OpenTelemetryDatabase extends Database {
+        private final Database database;
+
+        OpenTelemetryDatabase(Database database) {
+            this.database = database;
+        }
+
+        @Override
+        public DataSource getDataSource() throws SQLException {
+            DataSource dataSource = database.getDataSource();
+            if (! (dataSource instanceof OpenTelemetryDataSource)) {
+                dataSource = JdbcTelemetry.create(GlobalOpenTelemetry.get()).wrap(dataSource);
+            }
+            return dataSource;
+        }
+    }
+
     static class LocalConnectionSupplier extends ConnectionSupplier {
 
         @Override
         protected Database database() {
-            return GlobalDatabaseConfiguration.get().getDatabase();
+            return new OpenTelemetryDatabase(GlobalDatabaseConfiguration.get().getDatabase());
         }
 
         @Override
@@ -303,7 +324,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         @Override protected Database database() {
-            return database;
+            return new OpenTelemetryDatabase(database);
         }
     }
 
@@ -900,7 +921,9 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     }
 
     private static void addSqlAttribute(Span span, String sql) {
-        span.setAttribute("sql", sql);
+        // `db.query.text` not yet in `DbIncubatingAttributes` of opentelemetry-semconv-incubating:1.25 so
+        // manually declare it
+        span.setAttribute(AttributeKey.stringKey("db.query.text"), sql);
     }
 
     private static void addPackageAttribute(Span span, String packageName) {
