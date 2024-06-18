@@ -28,7 +28,6 @@ import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.instrumentation.jdbc.datasource.JdbcTelemetry;
 import io.opentelemetry.instrumentation.jdbc.datasource.OpenTelemetryDataSource;
-import io.opentelemetry.semconv.incubating.DbIncubatingAttributes;
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
@@ -169,7 +168,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             try (Connection connection = connectionSupplier.connection();
                     PreparedStatement statement = connection.prepareStatement(sql);
                     Scope ignore = publishSpan.makeCurrent()) {
-                addSqlAttribute(publishSpan, sql);
                 int count = 0;
                 for (SuiteResult suiteResult : result.getSuites()) {
                     for (CaseResult caseResult : suiteResult.getCases()) {
@@ -379,7 +377,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         var sql = "SELECT suite, package, "
                                 + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
                                 + "FROM caseResults WHERE job = ? AND build = ?";
-                        addSqlAttribute(span, sql);
+                        
                         try (var preparedStatement = connection.prepareStatement(sql)) {
                             preparedStatement.setString(1, job);
                             preparedStatement.setInt(2, build);
@@ -430,7 +428,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 packageResultsCache.invalidate(cacheKey);
                 return query(connection -> {
                     var sql = "DELETE FROM caseResults WHERE job = ? AND build = ?";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         span.setAttribute("job", job);
@@ -460,7 +458,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 invalidateCachesForJob(job);
                 return query(connection -> {
                     var sql = "DELETE FROM caseResults WHERE job = ?";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         span.setAttribute("job", job);
@@ -520,7 +518,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             + "sum(case when skipped is not null then 1 else 0 end) as skipCount, "
                             + "sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount "
                             + "FROM caseResults WHERE job = ? group by build order by build;";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         try (ResultSet result = statement.executeQuery()) {
@@ -548,7 +546,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 var sql = "SELECT build, sum(duration) as duration "
                         + "FROM caseResults "
                         + "WHERE job = ? group by build order by build;";
-                addSqlAttribute(span, sql);
+                
                 try (PreparedStatement statement = connection.prepareStatement(sql)) {
                     statement.setString(1, job);
                     try (ResultSet result = statement.executeQuery()) {
@@ -578,7 +576,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             + "sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount "
                             + "FROM caseResults "
                             + "WHERE job = ? GROUP BY build ORDER BY build DESC LIMIT 25 OFFSET ?;";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         span.setAttribute("job", job);
@@ -613,7 +611,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getCountOfBuildsWithTestResults", span ->
                     query(connection -> {
                         var sql = "SELECT COUNT(DISTINCT build) as count FROM caseResults WHERE job = ?;";
-                        addSqlAttribute(span, sql);
+                        
                         try (PreparedStatement statement = connection.prepareStatement(sql)) {
                             statement.setString(1, job);
                             span.setAttribute("job", job);
@@ -657,7 +655,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             "AND errordetails IS NULL " +
                             "ORDER BY BUILD DESC " +
                             "LIMIT 1";
-                    addSqlAttribute(spanPassingBuild, sqlPassingBuild);
                     try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
                          Scope ignore = spanPassingBuild.makeCurrent()) {
                         addCaseResultToStatement(caseResult, build, statement);
@@ -683,7 +680,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             "AND errordetails is NOT NULL " +
                             "ORDER BY BUILD ASC " +
                             "LIMIT 1";
-                    addSqlAttribute(spanFailingBuild, sqlFailedBuild);
                     try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
                          Scope ignore = spanFailingBuild.makeCurrent()) {
                         addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
@@ -870,7 +866,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         public TestResult getPreviousResult() {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousResult", span -> {
                 var sql = "SELECT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT 1";
-                addSqlAttribute(span, sql);
+                
                 return query(connection -> {
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
@@ -918,10 +914,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         } finally {
             span.end();
         }
-    }
-
-    private static void addSqlAttribute(Span span, String sql) {
-        span.setAttribute(DbIncubatingAttributes.DB_STATEMENT, sql);
     }
 
     private static void addPackageAttribute(Span span, String packageName) {
