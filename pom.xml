@@ -14,7 +14,8 @@
     <properties>
         <changelist>999999-SNAPSHOT</changelist>
         <gitHubRepo>jenkinsci/junit-sql-storage-plugin</gitHubRepo>
-        <jenkins.version>2.414.3</jenkins.version>
+        <jenkins.baseline>2.440</jenkins.baseline>
+        <jenkins.version>${jenkins.baseline}.3</jenkins.version>
         <useBeta>true</useBeta>
         <opentelemetry.version>1.39.0</opentelemetry.version>
         <opentelemetry-alpha.version>1.39.0-alpha</opentelemetry-alpha.version>
@@ -27,8 +28,8 @@
         <dependencies>
             <dependency>
                 <groupId>io.jenkins.tools.bom</groupId>
-                <artifactId>bom-2.414.x</artifactId>
-                <version>2907.vcb_35d6f2f7de</version>
+                <artifactId>bom-${jenkins.baseline}.x</artifactId>
+                <version>3135.v6d6c1f6b_3572</version>
                 <scope>import</scope>
                 <type>pom</type>
             </dependency>
