@@ -17,6 +17,8 @@
         <jenkins.baseline>2.440</jenkins.baseline>
         <jenkins.version>${jenkins.baseline}.3</jenkins.version>
         <useBeta>true</useBeta>
+        <jenkins-plugin-opentelemetry.version>3.1215.vc9db_a_0b_34c2a_</jenkins-plugin-opentelemetry.version>
+        <opentelemetry-instrumentation.version>2.5.0</opentelemetry-instrumentation.version>
     </properties>
     <name>Junit SQL Storage Plugin</name>
     <url>https://github.com/jenkinsci/${project.artifactId}-plugin</url>
@@ -29,6 +31,13 @@
                 <scope>import</scope>
                 <type>pom</type>
             </dependency>
+            <dependency>
+                <groupId>io.opentelemetry.instrumentation</groupId>
+                <artifactId>opentelemetry-instrumentation-bom-alpha</artifactId>
+                <version>${opentelemetry-instrumentation.version}-alpha</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
         </dependencies>
     </dependencyManagement>
     <dependencies>
@@ -40,6 +49,7 @@
             <groupId>io.jenkins.plugins</groupId>
             <artifactId>flyway-api</artifactId>
         </dependency>
+
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>database-postgresql</artifactId>
@@ -56,13 +66,18 @@
         <dependency>
             <groupId>io.jenkins.plugins</groupId>
             <artifactId>opentelemetry</artifactId>
-            <version>3.1215.vc9db_a_0b_34c2a_</version>
+            <version>${jenkins-plugin-opentelemetry.version}</version>
             <exclusions>
                 <exclusion>
+                    <!-- 2.18.0 (managed) vs 2.28.0 -->
                     <groupId>com.google.errorprone</groupId>
                     <artifactId>error_prone_annotations</artifactId>
                 </exclusion>
             </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-jdbc</artifactId>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins.workflow</groupId>

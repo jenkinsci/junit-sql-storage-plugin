@@ -1,24 +1,5 @@
 package io.jenkins.plugins.junit.storage.database;
 
-import java.io.IOException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Types;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
-import java.util.function.Supplier;
-import java.util.logging.Logger;
-import java.util.stream.Collectors;
-
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalCause;
@@ -45,6 +26,8 @@ import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
+import io.opentelemetry.instrumentation.jdbc.datasource.JdbcTelemetry;
+import io.opentelemetry.instrumentation.jdbc.datasource.OpenTelemetryDataSource;
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
@@ -53,6 +36,26 @@ import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
 import org.jenkinsci.remoting.SerializableOnlyOverRemoting;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
+
+import javax.sql.DataSource;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 @Extension
 public class DatabaseTestResultStorage extends JunitTestResultStorage {
@@ -165,7 +168,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             try (Connection connection = connectionSupplier.connection();
                     PreparedStatement statement = connection.prepareStatement(sql);
                     Scope ignore = publishSpan.makeCurrent()) {
-                addSqlAttribute(publishSpan, sql);
                 int count = 0;
                 for (SuiteResult suiteResult : result.getSuites()) {
                     for (CaseResult caseResult : suiteResult.getCases()) {
@@ -275,11 +277,28 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
     }
 
+    static class OpenTelemetryDatabase extends Database {
+        private final Database database;
+
+        OpenTelemetryDatabase(Database database) {
+            this.database = database;
+        }
+
+        @Override
+        public DataSource getDataSource() throws SQLException {
+            DataSource dataSource = database.getDataSource();
+            if (! (dataSource instanceof OpenTelemetryDataSource)) {
+                dataSource = JdbcTelemetry.create(GlobalOpenTelemetry.get()).wrap(dataSource);
+            }
+            return dataSource;
+        }
+    }
+
     static class LocalConnectionSupplier extends ConnectionSupplier {
 
         @Override
         protected Database database() {
-            return GlobalDatabaseConfiguration.get().getDatabase();
+            return new OpenTelemetryDatabase(GlobalDatabaseConfiguration.get().getDatabase());
         }
 
         @Override
@@ -303,7 +322,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         @Override protected Database database() {
-            return database;
+            return new OpenTelemetryDatabase(database);
         }
     }
 
@@ -358,7 +377,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         var sql = "SELECT suite, package, "
                                 + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
                                 + "FROM caseResults WHERE job = ? AND build = ?";
-                        addSqlAttribute(span, sql);
+                        
                         try (var preparedStatement = connection.prepareStatement(sql)) {
                             preparedStatement.setString(1, job);
                             preparedStatement.setInt(2, build);
@@ -409,7 +428,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 packageResultsCache.invalidate(cacheKey);
                 return query(connection -> {
                     var sql = "DELETE FROM caseResults WHERE job = ? AND build = ?";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         span.setAttribute("job", job);
@@ -439,7 +458,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 invalidateCachesForJob(job);
                 return query(connection -> {
                     var sql = "DELETE FROM caseResults WHERE job = ?";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         span.setAttribute("job", job);
@@ -499,7 +518,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             + "sum(case when skipped is not null then 1 else 0 end) as skipCount, "
                             + "sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount "
                             + "FROM caseResults WHERE job = ? group by build order by build;";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         try (ResultSet result = statement.executeQuery()) {
@@ -527,7 +546,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 var sql = "SELECT build, sum(duration) as duration "
                         + "FROM caseResults "
                         + "WHERE job = ? group by build order by build;";
-                addSqlAttribute(span, sql);
+                
                 try (PreparedStatement statement = connection.prepareStatement(sql)) {
                     statement.setString(1, job);
                     try (ResultSet result = statement.executeQuery()) {
@@ -557,7 +576,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             + "sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount "
                             + "FROM caseResults "
                             + "WHERE job = ? GROUP BY build ORDER BY build DESC LIMIT 25 OFFSET ?;";
-                    addSqlAttribute(span, sql);
+                    
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
                         span.setAttribute("job", job);
@@ -592,7 +611,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getCountOfBuildsWithTestResults", span ->
                     query(connection -> {
                         var sql = "SELECT COUNT(DISTINCT build) as count FROM caseResults WHERE job = ?;";
-                        addSqlAttribute(span, sql);
+                        
                         try (PreparedStatement statement = connection.prepareStatement(sql)) {
                             statement.setString(1, job);
                             span.setAttribute("job", job);
@@ -636,7 +655,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             "AND errordetails IS NULL " +
                             "ORDER BY BUILD DESC " +
                             "LIMIT 1";
-                    addSqlAttribute(spanPassingBuild, sqlPassingBuild);
                     try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
                          Scope ignore = spanPassingBuild.makeCurrent()) {
                         addCaseResultToStatement(caseResult, build, statement);
@@ -662,7 +680,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             "AND errordetails is NOT NULL " +
                             "ORDER BY BUILD ASC " +
                             "LIMIT 1";
-                    addSqlAttribute(spanFailingBuild, sqlFailedBuild);
                     try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
                          Scope ignore = spanFailingBuild.makeCurrent()) {
                         addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
@@ -849,7 +866,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         public TestResult getPreviousResult() {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousResult", span -> {
                 var sql = "SELECT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT 1";
-                addSqlAttribute(span, sql);
+                
                 return query(connection -> {
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
@@ -897,10 +914,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         } finally {
             span.end();
         }
-    }
-
-    private static void addSqlAttribute(Span span, String sql) {
-        span.setAttribute("sql", sql);
     }
 
     private static void addPackageAttribute(Span span, String packageName) {
