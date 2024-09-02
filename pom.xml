@@ -56,7 +56,7 @@
         <dependency>
             <groupId>io.jenkins.plugins</groupId>
             <artifactId>opentelemetry</artifactId>
-            <version>3.1320.v2eededb_d909e</version>
+            <version>3.1368.vb_f1dcb_e6595c</version>
             <exclusions>
                 <exclusion>
                     <groupId>com.google.errorprone</groupId>
