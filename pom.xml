@@ -55,14 +55,8 @@
         </dependency>
         <dependency>
             <groupId>io.jenkins.plugins</groupId>
-            <artifactId>opentelemetry</artifactId>
-            <version>3.1368.vb_f1dcb_e6595c</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>com.google.errorprone</groupId>
-                    <artifactId>error_prone_annotations</artifactId>
-                </exclusion>
-            </exclusions>
+            <artifactId>opentelemetry-api</artifactId>
+            <version>1.40.0-36.v1e02b_b_4db_8f4</version>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins.workflow</groupId>
