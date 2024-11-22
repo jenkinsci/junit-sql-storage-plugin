@@ -4,7 +4,7 @@
     <parent>
         <groupId>org.jenkins-ci.plugins</groupId>
         <artifactId>plugin</artifactId>
-        <version>4.88</version>
+        <version>5.3</version>
         <relativePath />
     </parent>
     <groupId>io.jenkins.plugins</groupId>
@@ -14,8 +14,8 @@
     <properties>
         <changelist>999999-SNAPSHOT</changelist>
         <gitHubRepo>jenkinsci/junit-sql-storage-plugin</gitHubRepo>
-        <jenkins.baseline>2.440</jenkins.baseline>
-        <jenkins.version>${jenkins.baseline}.3</jenkins.version>
+        <jenkins.baseline>2.479</jenkins.baseline>
+        <jenkins.version>${jenkins.baseline}.1</jenkins.version>
         <useBeta>true</useBeta>
     </properties>
     <name>Junit SQL Storage Plugin</name>
@@ -25,7 +25,7 @@
             <dependency>
                 <groupId>io.jenkins.tools.bom</groupId>
                 <artifactId>bom-${jenkins.baseline}.x</artifactId>
-                <version>3435.v238d66a_043fb_</version>
+                <version>3722.vcc62e7311580</version>
                 <scope>import</scope>
                 <type>pom</type>
             </dependency>
@@ -39,6 +39,7 @@
         <dependency>
             <groupId>io.jenkins.plugins</groupId>
             <artifactId>flyway-api</artifactId>
+            <version>11.0.0-198.vc8a_25eea_d210</version>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
