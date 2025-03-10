@@ -49,6 +49,7 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>junit</artifactId>
+            <version>1276.v7c398a_99067e</version>
         </dependency>
         <dependency>
             <groupId>io.jenkins.plugins</groupId>
@@ -72,7 +73,6 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins.workflow</groupId>
             <artifactId>workflow-job</artifactId>
-            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins.workflow</groupId>
