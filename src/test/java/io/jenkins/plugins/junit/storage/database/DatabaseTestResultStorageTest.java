@@ -20,7 +20,6 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
-import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableSet;
 import hudson.model.Label;
@@ -44,13 +43,11 @@ import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.jetbrains.annotations.NotNull;
-import org.junit.Before;
-import org.junit.ClassRule;
-import org.junit.Rule;
-import org.junit.Test;
-import org.jvnet.hudson.test.BuildWatcher;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
-import org.jvnet.hudson.test.LoggerRule;
+import org.jvnet.hudson.test.LogRecorder;
+import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import org.mockito.Mockito;
 import org.mockito.exceptions.base.MockitoInitializationException;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -70,46 +67,43 @@ import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasProperty;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.core.Is.is;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-public class DatabaseTestResultStorageTest {
+@WithJenkins
+class DatabaseTestResultStorageTest {
 
     private static final String TEST_IMAGE = "postgres:16-alpine";
     private static final String BUILD_PIPELINE =
-            "node('remote') {\n" +
-            "    writeFile file: 'x.xml', text: '''<testsuite name='sweet' time='200.0'>\n" +
-            "        <testcase classname='Klazz' name='test1' time='198.0'><error message='failure'/></testcase>\n" +
-            "        <testcase classname='Klazz' name='test2' time='2.0'/>\n" +
-            "        <testcase classname='other.Klazz' name='test3'><skipped message='Not actually run.'/></testcase>\n" +
-            "    </testsuite>'''\n" +
-            "    def s = junit 'x.xml'\n" +
-            "    echo(/summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
-            "    writeFile file: 'x.xml', text: '''<testsuite name='supersweet'>\n" +
-            "        <testcase classname='another.Klazz' name='test1'><error message='another failure'/></testcase>\n" +
-            "    </testsuite>'''\n" +
-            "    s = junit 'x.xml'\n" +
-            "    echo(/next summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
-            "}\n";
+            """
+                    node('remote') {
+                        writeFile file: 'x.xml', text: '''<testsuite name='sweet' time='200.0'>
+                            <testcase classname='Klazz' name='test1' time='198.0'><error message='failure'/></testcase>
+                            <testcase classname='Klazz' name='test2' time='2.0'/>
+                            <testcase classname='other.Klazz' name='test3'><skipped message='Not actually run.'/></testcase>
+                        </testsuite>'''
+                        def s = junit 'x.xml'
+                        echo(/summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)
+                        writeFile file: 'x.xml', text: '''<testsuite name='supersweet'>
+                            <testcase classname='another.Klazz' name='test1'><error message='another failure'/></testcase>
+                        </testsuite>'''
+                        s = junit 'x.xml'
+                        echo(/next summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)
+                    }
+                    """;
 
+    private JenkinsRule jenkinsRule;
 
-    @ClassRule
-    public static BuildWatcher buildWatcher = new BuildWatcher();
+    private final LogRecorder logging = new LogRecorder().record(DatabaseTestResultStorage.class.getName(), Level.INFO);
 
-    @Rule
-    public JenkinsRule jenkinsRule = new JenkinsRule();
-
-    @Rule
-    public LoggerRule loggerRule = new LoggerRule();
-
-    @Before
-    public void setup() {
-       loggerRule.record(DatabaseTestResultStorage.class.getName(), Level.INFO);
+    @BeforeEach
+    void setUp(JenkinsRule rule) {
+        jenkinsRule = rule;
     }
 
     @Test
-    public void smokes() throws Exception {
+    void smokes() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
 
@@ -123,11 +117,11 @@ public class DatabaseTestResultStorageTest {
             jenkinsRule.assertLogContains("summary: fail=1 skip=1 pass=1 total=3", workflowRun);
             jenkinsRule.assertLogContains("next summary: fail=1 skip=0 pass=0 total=1", workflowRun);
             assertFalse(new File(workflowRun.getRootDir(), "junitResult.xml").isFile());
-            String buildXml = FileUtils.readFileToString(new File(workflowRun.getRootDir(), "build.xml"));
+            String buildXml = FileUtils.readFileToString(new File(workflowRun.getRootDir(), "build.xml"), StandardCharsets.UTF_8);
             Document doc = DocumentBuilderFactory.newInstance().newDocumentBuilder()
                     .parse(new ByteArrayInputStream(buildXml.getBytes(StandardCharsets.UTF_8)));
             NodeList testResultActionList = doc.getElementsByTagName("hudson.tasks.junit.TestResultAction");
-            assertEquals(buildXml, 1, testResultActionList.getLength());
+            assertEquals(1, testResultActionList.getLength(), buildXml);
             Element testResultActionElement = (Element) testResultActionList.item(0);
             NodeList childNodes = testResultActionElement.getChildNodes();
             Set<String> childNames = new TreeSet<>();
@@ -140,8 +134,9 @@ public class DatabaseTestResultStorageTest {
 
             printAndVerifyCaseResultsTable(true);
 
-            assertEquals(buildXml, ImmutableSet.of("healthScaleFactor", "testData", "descriptions"),
-                    childNames);
+            assertEquals(ImmutableSet.of("healthScaleFactor", "testData", "descriptions"),
+                    childNames,
+                    buildXml);
             TestResultAction testResultAction = workflowRun.getAction(TestResultAction.class);
             assertNotNull(testResultAction);
 
@@ -226,56 +221,8 @@ public class DatabaseTestResultStorageTest {
         }
     }
 
-    private void printCaseResultsTable() throws SQLException {
-        printAndVerifyCaseResultsTable(false);
-    }
-
-    private void printAndVerifyCaseResultsTable(boolean verifyTable) throws SQLException {
-        try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
-                PreparedStatement statement = connection.prepareStatement("SELECT * FROM caseResults", ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
-                ResultSet result = statement.executeQuery()) {
-            if (verifyTable) verifyTableStructure(connection);
-            printResultSet(result);
-        }
-    }
-
-    private void verifyTableStructure(Connection connection)
-            throws SQLException {
-        DatabaseMetaData metaData = connection.getMetaData();
-        ResultSet resultSet = metaData.getColumns(null, null, "caseresults", null);
-
-        while (resultSet.next()) {
-            String columnName = resultSet.getString("COLUMN_NAME");
-            String columnType = resultSet.getString("TYPE_NAME");
-
-            Map<String, String> mapOfColumnTypes = getCaseResultsColumnTypes();
-
-            assertThat(mapOfColumnTypes, hasKey(columnName));
-            assertThat("Unexpected columnType for column '" + columnName + "'",
-                    columnType, equalToIgnoringCase(mapOfColumnTypes.get(columnName)));
-        }
-    }
-
-    private static @NotNull Map<String, String> getCaseResultsColumnTypes() {
-        Map<String, String> mapOfColumnTypes = new HashMap<>();
-        mapOfColumnTypes.put("job", "VARCHAR");
-        mapOfColumnTypes.put("build", "INT4");
-        mapOfColumnTypes.put("suite", "VARCHAR");
-        mapOfColumnTypes.put("package", "VARCHAR");
-        mapOfColumnTypes.put("classname", "VARCHAR");
-        mapOfColumnTypes.put("testname", "VARCHAR");
-        mapOfColumnTypes.put("errordetails", "VARCHAR");
-        mapOfColumnTypes.put("skipped", "VARCHAR");
-        mapOfColumnTypes.put("duration", "NUMERIC");
-        mapOfColumnTypes.put("stdout", "VARCHAR");
-        mapOfColumnTypes.put("stderr", "VARCHAR");
-        mapOfColumnTypes.put("stacktrace", "VARCHAR");
-        mapOfColumnTypes.put("timestamp", "TIMESTAMP");
-        return mapOfColumnTypes;
-    }
-
     @Test
-    public void testResultCleanup() throws Exception {
+    void testResultCleanup() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
 
@@ -337,7 +284,7 @@ public class DatabaseTestResultStorageTest {
     }
 
     @Test
-    public void testResultCleanup_skipped_if_disabled() throws Exception {
+    void testResultCleanup_skipped_if_disabled() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
 
@@ -394,7 +341,7 @@ public class DatabaseTestResultStorageTest {
     }
 
     @Test
-    public void testResult_long_string() throws Exception {
+    void testResult_long_string() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
 
@@ -404,15 +351,17 @@ public class DatabaseTestResultStorageTest {
             WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "p");
 
             p.setDefinition(new CpsFlowDefinition(
-                "node('remote') {\n" +
-                "    def s = junit 'x.xml'\n" +
-                "    echo(/summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
-                "    writeFile file: 'x.xml', text: '''<testsuite name='supersweet'>\n" +
-                "        <testcase classname='another.Klazz' name='test1'><error message='another failure'/></testcase>\n" +
-                "    </testsuite>'''\n" +
-                "    s = junit 'x.xml'\n" +
-                "    echo(/next summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)\n" +
-                "}\n", true));
+                    """
+                            node('remote') {
+                                def s = junit 'x.xml'
+                                echo(/summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)
+                                writeFile file: 'x.xml', text: '''<testsuite name='supersweet'>
+                                    <testcase classname='another.Klazz' name='test1'><error message='another failure'/></testcase>
+                                </testsuite>'''
+                                s = junit 'x.xml'
+                                echo(/next summary: fail=$s.failCount skip=$s.skipCount pass=$s.passCount total=$s.totalCount/)
+                            }
+                            """, true));
 
             //Because writeFile can't handle long string
             //We use file copy to prepare the test result
@@ -450,7 +399,7 @@ public class DatabaseTestResultStorageTest {
     }
 
     @Test
-    public void getCaseResults_mockDatabase() throws SQLException {
+    void getCaseResults_mockDatabase() throws SQLException {
         // Given
         var databaseTestResultStorage = new DatabaseTestResultStorage();
         databaseTestResultStorage.connectionSupplier = Mockito.mock(DatabaseTestResultStorage.ConnectionSupplier.class);
@@ -476,80 +425,136 @@ public class DatabaseTestResultStorageTest {
         assertEquals(expectedCaseResults.size(), actualCaseResults.size());
         verifyCaseResultsMatch("", expectedCaseResults, actualCaseResults);
 
-        assertEquals("Unexpected pass count", 6, testResultStorage.getPassCount());
-        assertEquals("Unexpected fail count", 1, testResultStorage.getFailCount());
-        assertEquals("Unexpected skip count", 3, testResultStorage.getSkipCount());
+        assertEquals(6, testResultStorage.getPassCount(), "Unexpected pass count");
+        assertEquals(1, testResultStorage.getFailCount(), "Unexpected fail count");
+        assertEquals(3, testResultStorage.getSkipCount(), "Unexpected skip count");
 
         List<CaseResult> expectedFailedTests = expectedCaseResults.stream()
                 .filter(CaseResult::isFailed)
-                .collect(Collectors.toList());
+                .toList();
         List<CaseResult> actualFailedTests = testResultStorage.getFailedTests();
         verifyCaseResultsMatch("failed tests", expectedFailedTests, actualFailedTests);
 
         List<CaseResult> expectedSkippedTests = expectedCaseResults.stream()
                 .filter(CaseResult::isSkipped)
-                .collect(Collectors.toList());
+                .toList();
         List<CaseResult> actualSkippedTests = testResultStorage.getSkippedTests();
         verifyCaseResultsMatch("skipped tests", expectedSkippedTests, actualSkippedTests);
 
         List<CaseResult> expectedSkippedTestsByPackage = expectedCaseResults.stream()
                 .filter(caseResult -> caseResult.getPackageName().equals("package1"))
                 .filter(CaseResult::isSkipped)
-                .collect(Collectors.toList());
+                .toList();
         List<CaseResult> actualSkippedTestsByPackage = testResultStorage.getSkippedTestsByPackage("package1");
         verifyCaseResultsMatch("skipped tests by package1", expectedSkippedTestsByPackage, actualSkippedTestsByPackage);
 
         expectedSkippedTestsByPackage = expectedCaseResults.stream()
                 .filter(caseResult -> caseResult.getPackageName().equals("package2"))
                 .filter(CaseResult::isSkipped)
-                .collect(Collectors.toList());
+                .toList();
         actualSkippedTestsByPackage = testResultStorage.getSkippedTestsByPackage("package2");
         verifyCaseResultsMatch("skipped tests by package2", expectedSkippedTestsByPackage, actualSkippedTestsByPackage);
 
         List<CaseResult> expectedPassedTests = expectedCaseResults.stream()
                 .filter(CaseResult::isPassed)
-                .collect(Collectors.toList());
+                .toList();
         List<CaseResult> actualPassedTests = testResultStorage.getPassedTests();
         verifyCaseResultsMatch("passed tests", expectedPassedTests, actualPassedTests);
 
         List<CaseResult> expectedPassedTestsByPackage = expectedCaseResults.stream()
                 .filter(caseResult -> caseResult.getPackageName().equals("package1"))
                 .filter(CaseResult::isPassed)
-                .collect(Collectors.toList());
+                .toList();
         List<CaseResult> actualPassedTestsByPackage = testResultStorage.getPassedTestsByPackage("package1");
         verifyCaseResultsMatch("passed tests by package1", expectedPassedTestsByPackage, actualPassedTestsByPackage);
 
         expectedPassedTestsByPackage = expectedCaseResults.stream()
                 .filter(caseResult -> caseResult.getPackageName().equals("package2"))
                 .filter(CaseResult::isPassed)
-                .collect(Collectors.toList());
+                .toList();
         actualPassedTestsByPackage = testResultStorage.getPassedTestsByPackage("package2");
         verifyCaseResultsMatch("passed tests by package2", expectedPassedTestsByPackage, actualPassedTestsByPackage);
 
         Mockito.verify(preparedStatement, Mockito.times(1)).executeQuery();
     }
 
+
+    private void printCaseResultsTable() throws Exception {
+        printAndVerifyCaseResultsTable(false);
+    }
+
+    private void printAndVerifyCaseResultsTable(boolean verifyTable) throws Exception {
+        try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource().getConnection();
+             PreparedStatement statement = connection.prepareStatement("SELECT * FROM caseResults", ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+             ResultSet result = statement.executeQuery()) {
+            if (verifyTable) verifyTableStructure(connection);
+            printResultSet(result);
+        }
+    }
+
+    private void verifyTableStructure(Connection connection) throws Exception {
+        DatabaseMetaData metaData = connection.getMetaData();
+        ResultSet resultSet = metaData.getColumns(null, null, "caseresults", null);
+
+        while (resultSet.next()) {
+            String columnName = resultSet.getString("COLUMN_NAME");
+            String columnType = resultSet.getString("TYPE_NAME");
+
+            Map<String, String> mapOfColumnTypes = getCaseResultsColumnTypes();
+
+            assertThat(mapOfColumnTypes, hasKey(columnName));
+            assertThat("Unexpected columnType for column '" + columnName + "'",
+                    columnType, equalToIgnoringCase(mapOfColumnTypes.get(columnName)));
+        }
+    }
+
+    private static @NotNull Map<String, String> getCaseResultsColumnTypes() {
+        Map<String, String> mapOfColumnTypes = new HashMap<>();
+        mapOfColumnTypes.put("job", "VARCHAR");
+        mapOfColumnTypes.put("build", "INT4");
+        mapOfColumnTypes.put("suite", "VARCHAR");
+        mapOfColumnTypes.put("package", "VARCHAR");
+        mapOfColumnTypes.put("classname", "VARCHAR");
+        mapOfColumnTypes.put("testname", "VARCHAR");
+        mapOfColumnTypes.put("errordetails", "VARCHAR");
+        mapOfColumnTypes.put("skipped", "VARCHAR");
+        mapOfColumnTypes.put("duration", "NUMERIC");
+        mapOfColumnTypes.put("stdout", "VARCHAR");
+        mapOfColumnTypes.put("stderr", "VARCHAR");
+        mapOfColumnTypes.put("stacktrace", "VARCHAR");
+        mapOfColumnTypes.put("timestamp", "TIMESTAMP");
+        return mapOfColumnTypes;
+    }
+
     private static void verifyCaseResultsMatch(String message, List<CaseResult> expectedCaseResults,
             List<CaseResult> actualCaseResults) {
         for (int i = 0; i < expectedCaseResults.size(); i++) {
-            assertEquals("Unexpected packageName for " + message, expectedCaseResults.get(i).getPackageName(),
-                    actualCaseResults.get(i).getPackageName());
-            assertEquals("Unexpected className for " + message, expectedCaseResults.get(i).getClassName(),
-                    actualCaseResults.get(i).getClassName());
-            assertEquals("Unexpected name for " + message, expectedCaseResults.get(i).getName(),
-                    actualCaseResults.get(i).getName());
-            assertEquals("Unexpected errorDetails for " + message, expectedCaseResults.get(i).getErrorDetails(),
-                    actualCaseResults.get(i).getErrorDetails());
-            assertEquals("Unexpected skippedMessage for " + message, expectedCaseResults.get(i).getSkippedMessage(),
-                    actualCaseResults.get(i).getSkippedMessage());
-            assertEquals("Unexpected stdout for " + message, expectedCaseResults.get(i).getStdout(),
-                    actualCaseResults.get(i).getStdout());
-            assertEquals("Unexpected stderr for " + message, expectedCaseResults.get(i).getStderr(),
-                    actualCaseResults.get(i).getStderr());
-            assertEquals("Unexpected errorStackTrace for " + message, expectedCaseResults.get(i).getErrorStackTrace(),
-                    actualCaseResults.get(i).getErrorStackTrace());
-            assertEquals("Unexpected duration for " + message, expectedCaseResults.get(i).getDuration(),
-                    actualCaseResults.get(i).getDuration(), 0.01);
+            assertEquals(expectedCaseResults.get(i).getPackageName(),
+                    actualCaseResults.get(i).getPackageName(),
+                    "Unexpected packageName for " + message);
+            assertEquals(expectedCaseResults.get(i).getClassName(),
+                    actualCaseResults.get(i).getClassName(),
+                    "Unexpected className for " + message);
+            assertEquals(expectedCaseResults.get(i).getName(),
+                    actualCaseResults.get(i).getName(),
+                    "Unexpected name for " + message);
+            assertEquals(expectedCaseResults.get(i).getErrorDetails(),
+                    actualCaseResults.get(i).getErrorDetails(),
+                    "Unexpected errorDetails for " + message);
+            assertEquals(expectedCaseResults.get(i).getSkippedMessage(),
+                    actualCaseResults.get(i).getSkippedMessage(),
+                    "Unexpected skippedMessage for " + message);
+            assertEquals(expectedCaseResults.get(i).getStdout(),
+                    actualCaseResults.get(i).getStdout(),
+                    "Unexpected stdout for " + message);
+            assertEquals(expectedCaseResults.get(i).getStderr(),
+                    actualCaseResults.get(i).getStderr(),
+                    "Unexpected stderr for " + message);
+            assertEquals(expectedCaseResults.get(i).getErrorStackTrace(),
+                    actualCaseResults.get(i).getErrorStackTrace(),
+                    "Unexpected errorStackTrace for " + message);
+            assertEquals(expectedCaseResults.get(i).getDuration(),
+                    actualCaseResults.get(i).getDuration(), 0.01, "Unexpected duration for " + message);
         }
     }
 
@@ -676,7 +681,7 @@ public class DatabaseTestResultStorageTest {
         return caseResults;
     }
 
-    private void setupPlugin(PostgreSQLContainer<?> postgres) throws SQLException {
+    private void setupPlugin(PostgreSQLContainer<?> postgres) {
         // comment this out if you hit the below test containers issue
         postgres.start();
 
@@ -693,9 +698,9 @@ public class DatabaseTestResultStorageTest {
 
     /**
      * @param resultSet the result set to print (note: that the resultSet should be scrollable and not forward only)
-     * @throws SQLException if an error occurs while accessing the ResultSet
+     * @throws Exception if an error occurs while accessing the ResultSet
      */
-    private static void printResultSet(ResultSet resultSet) throws SQLException {
+    private static void printResultSet(ResultSet resultSet) throws Exception {
         ResultSetMetaData resultSetMetaData = resultSet.getMetaData();
         int columnsNumber = resultSetMetaData.getColumnCount();
 

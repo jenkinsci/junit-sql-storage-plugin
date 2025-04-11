@@ -4,10 +4,10 @@ import io.jenkins.plugins.casc.ConfigurationContext;
 import io.jenkins.plugins.casc.ConfiguratorRegistry;
 import io.jenkins.plugins.casc.misc.ConfiguredWithCode;
 import io.jenkins.plugins.casc.misc.JenkinsConfiguredWithCodeRule;
+import io.jenkins.plugins.casc.misc.junit.jupiter.WithJenkinsConfiguredWithCode;
 import io.jenkins.plugins.casc.model.CNode;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
-import org.junit.ClassRule;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import static io.jenkins.plugins.casc.misc.Util.getUnclassifiedRoot;
 import static io.jenkins.plugins.casc.misc.Util.toStringFromYamlFile;
@@ -16,19 +16,18 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.isA;
 
-public class DatabaseJcascTestResultStorageTest {
-
-    @ClassRule
-    @ConfiguredWithCode("configuration-as-code.yml")
-    public static JenkinsConfiguredWithCodeRule j = new JenkinsConfiguredWithCodeRule();
+@WithJenkinsConfiguredWithCode
+class DatabaseJcascTestResultStorageTest {
 
     @Test
-    public void should_support_configuration_as_code() {
+    @ConfiguredWithCode("configuration-as-code.yml")
+    void should_support_configuration_as_code(JenkinsConfiguredWithCodeRule j) {
         assertThat(JunitTestResultStorageConfiguration.get().getStorage(), isA(DatabaseTestResultStorage.class));
     }
 
     @Test
-    public void should_support_configuration_export() throws Exception {
+    @ConfiguredWithCode("configuration-as-code.yml")
+    void should_support_configuration_export(JenkinsConfiguredWithCodeRule j) throws Exception {
         ConfiguratorRegistry registry = ConfiguratorRegistry.get();
         ConfigurationContext context = new ConfigurationContext(registry);
         CNode yourAttribute = getUnclassifiedRoot(context).get("junitTestResultStorage");
