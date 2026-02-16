@@ -57,7 +57,7 @@
         <dependency>
             <groupId>io.jenkins.plugins</groupId>
             <artifactId>opentelemetry-api</artifactId>
-            <version>1.49.0.77.va_c69ec2472c0</version>
+            <version>1.49.0.94.v5fc5325d5e7a_</version>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins.workflow</groupId>
