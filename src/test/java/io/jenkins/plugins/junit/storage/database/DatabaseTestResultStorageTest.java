@@ -42,7 +42,7 @@ import org.jenkinsci.plugins.database.postgresql.PostgreSQLDatabase;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
-import org.jetbrains.annotations.NotNull;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -508,7 +508,7 @@ class DatabaseTestResultStorageTest {
         }
     }
 
-    private static @NotNull Map<String, String> getCaseResultsColumnTypes() {
+    private static @NonNull Map<String, String> getCaseResultsColumnTypes() {
         Map<String, String> mapOfColumnTypes = new HashMap<>();
         mapOfColumnTypes.put("job", "VARCHAR");
         mapOfColumnTypes.put("build", "INT4");
@@ -646,7 +646,7 @@ class DatabaseTestResultStorageTest {
         return resultSet;
     }
 
-    private static @NotNull MockitoInitializationException getMockException(int index,
+    private static @NonNull MockitoInitializationException getMockException(int index,
             String columnLabel) {
         return new MockitoInitializationException("Did not expect " + index + "'" + columnLabel + "' calls");
     }
