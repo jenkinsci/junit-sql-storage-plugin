@@ -1,0 +1,151 @@
+// Reproduction Pipeline for https://github.com/jenkinsci/junit-sql-storage-plugin/issues/532
+//
+// "Test report of a running build reloads all test cases from DB on every call
+// (UI hangs with large result sets)"
+//
+// Prerequisites:
+//   - Jenkins configured with the JUnit SQL Storage plugin against MySQL (or any
+//     configured SQL backend).
+//   - A node/agent matching AGENT_LABEL with Python 3 available and network
+//     connectivity to the configured database (publishing happens on the agent).
+//   - Pipeline, Pipeline: Input Step, and JUnit plugins installed.
+//
+// Usage:
+//   1. Create a Pipeline job and paste this script (or point it at this file via
+//      "Pipeline script from SCM").
+//   2. Run with the default "smoke" profile first to validate the setup.
+//   3. Switch PROFILE to "issue" to reproduce the full-size dataset from the
+//      report (132,211 cases across 3,808 packages, published by 16 parallel
+//      junit steps).
+//   4. While the build is paused at the "Inspect running build" stage, open the
+//      build page and its "Test Result" page repeatedly and watch the
+//      controller log for repeated
+//      "Loaded N package results from case results" / "Loaded N test cases from
+//      database" messages attributable to a single page view.
+//   5. Click "Finish build" (or let the 30 minute timeout abort it) to let the
+//      build complete, then compare load times/log behavior on the completed
+//      build.
+//
+// Notes:
+//   - Synthetic failures/skips are injected on purpose; the build is expected to
+//     finish UNSTABLE. This does not affect the reproduction.
+//   - This job does not reserve an executor during the pause: the `input` step
+//     is outside the `node` block.
+//   - Only run this against a disposable Jenkins instance/job: the "issue"
+//     profile is designed to stress the controller and database.
+
+properties([
+    disableConcurrentBuilds(),
+    parameters([
+        string(name: 'AGENT_LABEL', defaultValue: 'agent',
+               description: 'Label of an agent with Python 3 and connectivity to the configured database'),
+        choice(name: 'PROFILE', choices: ['smoke', 'issue'],
+               description: 'smoke: 1,320 cases / 38 packages / 4 publishers; issue: 132,211 cases / 3,808 packages / 16 publishers (as in the report)'),
+        booleanParam(name: 'INCLUDE_STDIO', defaultValue: false,
+                     description: 'Add 1 KiB each of stdout/stderr per case to also stress the large text columns; increases load further')
+    ])
+])
+
+def issueSize = params.PROFILE == 'issue'
+def caseCount = issueSize ? 132211 : 1320
+def packageCount = issueSize ? 3808 : 38
+def publisherCount = issueSize ? 16 : 4
+def payloadBytes = params.INCLUDE_STDIO ? 1024 : 0
+
+node(params.AGENT_LABEL) {
+    dir("issue-532-${env.BUILD_NUMBER}") {
+        stage('Generate reports') {
+            withEnv([
+                "CASE_COUNT=${caseCount}",
+                "PACKAGE_COUNT=${packageCount}",
+                "PUBLISHER_COUNT=${publisherCount}",
+                "PAYLOAD_BYTES=${payloadBytes}"
+            ]) {
+                sh '''
+python3 - <<'PY'
+import os
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+total = int(os.environ["CASE_COUNT"])
+packages = int(os.environ["PACKAGE_COUNT"])
+publishers = int(os.environ["PUBLISHER_COUNT"])
+payload = "x" * int(os.environ["PAYLOAD_BYTES"])
+roots = [ET.Element("testsuites") for _ in range(publishers)]
+counts = [0, 0, 0]  # Passed, failed, skipped.
+case_id = 0
+
+for package_id in range(packages):
+    package = f"repro532.p{package_id:05d}"
+    size = total // packages + (package_id < total % packages)
+    suite = ET.SubElement(
+        roots[package_id % publishers], "testsuite",
+        name=f"{package}.SyntheticTest", tests=str(size),
+        time=f"{size * 0.001:.3f}"
+    )
+    failures = skips = 0
+    for _ in range(size):
+        case = ET.SubElement(
+            suite, "testcase", classname=f"{package}.SyntheticTest",
+            name=f"test_{case_id:06d}", time="0.001"
+        )
+        if case_id % 100 == 0:
+            ET.SubElement(case, "failure", message="Synthetic failure",
+                          type="AssertionError").text = "Synthetic stack trace"
+            failures += 1
+            counts[1] += 1
+        elif case_id % 100 == 1:
+            ET.SubElement(case, "skipped", message="Synthetic skip")
+            skips += 1
+            counts[2] += 1
+        else:
+            counts[0] += 1
+        if payload:
+            ET.SubElement(case, "system-out").text = payload
+            ET.SubElement(case, "system-err").text = payload
+        case_id += 1
+    suite.set("failures", str(failures))
+    suite.set("errors", "0")
+    suite.set("skipped", str(skips))
+
+assert case_id == total
+assert sum(counts) == total
+for shard, root in enumerate(roots):
+    directory = Path(f"shard-{shard}")
+    directory.mkdir(exist_ok=True)
+    ET.ElementTree(root).write(
+        directory / "results.xml", encoding="utf-8", xml_declaration=True
+    )
+print(f"EXPECTED total={total} packages={packages} suites={packages} "
+      f"passed={counts[0]} failed={counts[1]} skipped={counts[2]}", flush=True)
+PY
+'''
+            }
+        }
+        stage('Publish in parallel') {
+            def branches = [:]
+            for (int i = 0; i < publisherCount; i++) {
+                def shard = i
+                branches["publisher-${shard}"] = {
+                    dir("shard-${shard}") {
+                        echo "Starting publisher ${shard}"
+                        junit testResults: 'results.xml', keepLongStdio: true
+                        echo "Finished publisher ${shard}"
+                    }
+                }
+            }
+            echo "Inspect ${env.BUILD_URL}testReport/ during publishing if publishing itself slows down."
+            parallel branches
+        }
+    }
+}
+
+stage('Inspect running build') {
+    echo "All publishers finished. Build is deliberately still running."
+    echo "Build page: ${env.BUILD_URL}"
+    echo "Test report: ${env.BUILD_URL}testReport/"
+    timeout(time: 30, unit: 'MINUTES') {
+        input message: 'Inspect the running build and test report, then proceed to compare the completed build.',
+              ok: 'Finish build'
+    }
+}

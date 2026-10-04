@@ -131,6 +131,47 @@ acktrace |         timestamp
 (2 rows)
 ```
 
+## Reproducing issues
+
+### Issue #532: running-build test report reloads all test cases from the database on every call
+
+[examples/issue-532/Jenkinsfile](examples/issue-532/Jenkinsfile) is a self-contained Pipeline that
+reproduces [#532](https://github.com/jenkinsci/junit-sql-storage-plugin/issues/532): while a build is
+still running, viewing its build page or "Test Result" page repeatedly reloads every test case from the
+database because the result caches are invalidated on every access while `run.isBuilding()` is `true`.
+
+Prerequisites:
+
+- Jenkins configured with the JUnit SQL Storage plugin against a SQL database (MySQL or PostgreSQL).
+- An agent with Python 3 and network connectivity to the configured database, matching the `AGENT_LABEL`
+  parameter (defaults to `agent`).
+
+Usage:
+
+1. Create a Pipeline job and paste in the Jenkinsfile (or point the job at this file via "Pipeline script
+   from SCM").
+2. Run with the default `smoke` profile first (1,320 test cases across 38 packages, published by 4
+   parallel `junit` steps) to validate the setup.
+3. Switch the `PROFILE` parameter to `issue` to reproduce the exact dataset size from the report: 132,211
+   test cases across 3,808 packages, published by 16 parallel `junit` steps.
+4. Once publishing finishes, the build pauses at an `input` step (without holding an agent executor) for
+   up to 30 minutes. While paused, repeatedly open the build page and its `testReport/` page, and watch
+   the controller log for repeated `Loaded N package results from case results` / `Loaded N test cases
+   from database` messages attributable to a single page view.
+5. Click "Finish build" (or let the pause time out) to let the build complete, then reload the same pages
+   to compare behavior once the cache is no longer invalidated on every access.
+
+> [!WARNING]
+> Only run the `issue` profile against a disposable Jenkins instance/job: it is designed to stress the
+> controller and database in the same way as the original report.
+
+As of the fix for #532, each build's test cases, package results, and pass/fail/skip/duration summary are
+cached per-build (keyed by job name and build number) and loaded from the database at most once; the cache
+is invalidated as soon as a `junit` step publishes new results for that build (not on every read), with a
+one-minute time-based expiry as a safety net. The summary counts/duration are computed with a single SQL
+aggregate query rather than by iterating the full case list, so viewing a running build's "Test Result"
+page repeatedly no longer triggers repeated full reloads of every test case.
+
 ## Contributing
 
 Refer to our [contribution guidelines](https://github.com/jenkinsci/.github/blob/master/CONTRIBUTING.md)
