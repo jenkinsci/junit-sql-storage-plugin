@@ -75,6 +75,19 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int MAX_DB_BATCH_SIZE = 2000;
 
     /**
+     * Upper bound on the total number of {@link CaseResult}s kept resident across all cached builds
+     * at once, used as the {@link Caffeine#maximumWeight} for {@link #resultsCache}. Entries are
+     * weighed by case count (a proxy for memory footprint, since per-case payloads such as stdout/
+     * stderr/stack traces dominate) rather than by entry count, so that e.g. a handful of very large
+     * builds (as can happen when several running builds with big suites are viewed around the same
+     * time) cannot together exceed a bounded heap budget. Overridable (system property, in number of
+     * test cases) for unusually large or small deployments/heaps; defaults conservatively since a
+     * single case can carry up to several hundred KB of stdout/stderr/stack trace text.
+     */
+    private static final long MAX_CACHED_CASE_RESULTS =
+            Long.getLong(DatabaseTestResultStorage.class.getName() + ".maxCachedCaseResults", 150_000L);
+
+    /**
      * A single cache of per-build results, keyed by exact job/build identity.
      * <p>Entries use a fixed expiry from creation (not sliding on access) as a safety net: normal
      * freshness is provided by explicit {@link #invalidate(String, int)} calls after publishing,
@@ -85,7 +98,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      */
     private static final Cache<CacheKey, ResultsEntry> resultsCache = Caffeine.newBuilder()
             .expireAfterWrite(1, TimeUnit.MINUTES)
-            .maximumSize(100)
+            .maximumWeight(MAX_CACHED_CASE_RESULTS)
+            .weigher((CacheKey key, ResultsEntry entry) -> entry.weight())
             .removalListener((CacheKey key, ResultsEntry ignore, RemovalCause cause) ->
                     log.config(String.format("Key '%s' removed from resultsCache because (%s)", key, cause)))
             .build();
@@ -453,7 +467,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         private ResultsEntry getEntry() {
-            return resultsCache.get(new CacheKey(job, build), k -> new ResultsEntry(job, build));
+            CacheKey key = new CacheKey(job, build);
+            return resultsCache.get(key, k -> new ResultsEntry(k, job, build));
         }
 
         void deleteRun() {
@@ -891,6 +906,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      * evicting this entry from {@link #resultsCache}, or by the fixed one-minute expiry.
      */
     private final class ResultsEntry {
+        private final CacheKey key;
         private final String job;
         private final int build;
         /** Used only to build {@link TestResult} parents; any instance for this job/build will do. */
@@ -905,10 +921,18 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         private volatile BuildSummary summary;
         private final Object summaryLock = new Object();
 
-        ResultsEntry(String job, int build) {
+        /** Cache weight (approximately the case count); 1 until the case list is actually loaded. */
+        private volatile int weight = 1;
+
+        ResultsEntry(CacheKey key, String job, int build) {
+            this.key = key;
             this.job = job;
             this.build = build;
             this.self = new TestResultStorage(job, build);
+        }
+
+        int weight() {
+            return weight;
         }
 
         private <T> T query(Querier<T> querier) {
@@ -930,6 +954,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 if (local == null) {
                     local = loadCaseResultsFromDB(span);
                     caseResults = local;
+                    // The entry was inserted into resultsCache with a placeholder weight of 1 before
+                    // any data was loaded (its actual size wasn't known yet); now that the case list
+                    // is loaded, update the weight and re-insert so Caffeine re-weighs this entry and
+                    // evicts older entries if the cache-wide case-count budget is now exceeded.
+                    weight = Math.max(1, local.size());
+                    resultsCache.put(key, this);
                 }
                 return local;
             }

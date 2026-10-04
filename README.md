@@ -172,6 +172,13 @@ one-minute time-based expiry as a safety net. The summary counts/duration are co
 aggregate query rather than by iterating the full case list, so viewing a running build's "Test Result"
 page repeatedly no longer triggers repeated full reloads of every test case.
 
+Because several builds' full case lists (including stdout/stderr/stack traces) can now be resident in
+memory at once, the cache is also bounded by total cached test-case count (summed across all cached
+builds), not just entry count, so that a handful of very large builds viewed around the same time cannot
+exceed a bounded heap budget. The default budget is 150,000 cases; override it with the
+`io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.maxCachedCaseResults` system property
+if your deployment's heap size and typical stdout/stderr payload sizes call for a different value.
+
 ## Contributing
 
 Refer to our [contribution guidelines](https://github.com/jenkinsci/.github/blob/master/CONTRIBUTING.md)
