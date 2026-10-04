@@ -168,16 +168,31 @@ Usage:
 As of the fix for #532, each build's test cases, package results, and pass/fail/skip/duration summary are
 cached per-build (keyed by job name and build number) and loaded from the database at most once; the cache
 is invalidated as soon as a `junit` step publishes new results for that build (not on every read), with a
-one-minute time-based expiry as a safety net. The summary counts/duration are computed with a single SQL
-aggregate query rather than by iterating the full case list, so viewing a running build's "Test Result"
-page repeatedly no longer triggers repeated full reloads of every test case.
+ten-minute time-based expiry as a safety net (long enough that it won't lapse mid-render of even a very
+large build's page, which would otherwise force an identical, equally slow reload on the next request).
+The summary counts/duration are computed with a single SQL aggregate query rather than by iterating the
+full case list, so viewing a running build's "Test Result" page repeatedly no longer triggers repeated
+full reloads of every test case.
 
 Because several builds' full case lists (including stdout/stderr/stack traces) can now be resident in
 memory at once, the cache is also bounded by total cached test-case count (summed across all cached
 builds), not just entry count, so that a handful of very large builds viewed around the same time cannot
-exceed a bounded heap budget. The default budget is 150,000 cases; override it with the
+exceed a bounded heap budget. The default budget is 500,000 cases; override it with the
 `io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.maxCachedCaseResults` system property
-if your deployment's heap size and typical stdout/stderr payload sizes call for a different value.
+if your deployment's heap size and typical stdout/stderr payload sizes call for a different value. This
+bound must comfortably exceed the size of a single large build: computing a test's "age" (`CaseResult
+.getPreviousResult()`) walks up to 25 historical builds by default, each of which needs its own case list
+resident at the same time as the current build's, so a budget too close to (or below) one large build's
+case count causes repeated evict-and-reload thrashing between the current and historical builds' entries
+instead of bounding memory cheaply.
+
+`DatabaseTestResultStorage`'s own per-build case/package/summary caching, a `getSuite(name)` lookup
+that is now backed by a memoized per-suite index rather than a full linear scan of every case in the
+build, a memoized "previous build" lookup, and a memoized per-test "failed since" lookup, are all relied
+on heavily by `CaseResult.getPreviousResult()`'s historical-build walk and `CaseResult.getFailedSinceRun()`
+(used to compute test "age"/"failed since", and called once per test case by views that list failing
+tests); each of these is now cached per build so that repeated calls (potentially once per test case)
+reuse a single query per cache generation instead of one (or two) queries per case.
 
 ## Contributing
 

@@ -8,11 +8,14 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -83,21 +86,31 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      * time) cannot together exceed a bounded heap budget. Overridable (system property, in number of
      * test cases) for unusually large or small deployments/heaps; defaults conservatively since a
      * single case can carry up to several hundred KB of stdout/stderr/stack trace text.
+     * <p>Note this bound must comfortably exceed the size of a single large build, since computing
+     * test "age"/"failed since" ({@link CaseResult#getPreviousResult()}) walks up to
+     * {@code PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX} (25 by default) historical builds, each of
+     * which needs its own case list resident at the same time as the current build's; setting this
+     * too close to (or below) the size of one large build causes repeated evict-and-reload thrashing
+     * between the current and historical builds' entries, which is far slower than either bound.
      */
     private static final long MAX_CACHED_CASE_RESULTS =
-            Long.getLong(DatabaseTestResultStorage.class.getName() + ".maxCachedCaseResults", 150_000L);
+            Long.getLong(DatabaseTestResultStorage.class.getName() + ".maxCachedCaseResults", 500_000L);
 
     /**
      * A single cache of per-build results, keyed by exact job/build identity.
      * <p>Entries use a fixed expiry from creation (not sliding on access) as a safety net: normal
      * freshness is provided by explicit {@link #invalidate(String, int)} calls after publishing,
-     * deletion, and build completion. An entry lazily and independently memoizes the full case list,
-     * the derived package list, and the SQL-computed summary (counts/duration), so that repeated
-     * accessors sharing a build only trigger one load of each kind per cache generation, including
-     * for running or empty-result builds.
+     * deletion, and build completion, so this expiry only matters if an invalidation is ever missed.
+     * It intentionally comfortably exceeds how long even a very large build's page can take to render
+     * (including the per-case "failed since"/age lookups below), since an entry expiring mid-request
+     * would otherwise force an identical, equally slow reload on every subsequent request as well. An
+     * entry lazily and independently memoizes the full case list, the derived package list, the
+     * SQL-computed summary (counts/duration), the previous build lookup, and per-case "failed since"
+     * results, so that repeated accessors sharing a build only trigger one load of each kind per cache
+     * generation, including for running or empty-result builds.
      */
     private static final Cache<CacheKey, ResultsEntry> resultsCache = Caffeine.newBuilder()
-            .expireAfterWrite(1, TimeUnit.MINUTES)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
             .maximumWeight(MAX_CACHED_CASE_RESULTS)
             .weigher((CacheKey key, ResultsEntry entry) -> entry.weight())
             .removalListener((CacheKey key, ResultsEntry ignore, RemovalCause cause) ->
@@ -654,60 +667,70 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getFailedSinceRun", span -> {
                 span.setAttribute("build", build);
                 span.setAttribute("job", job);
-                return query(connection -> {
-                    var spanPassingBuild = createSpan("lastPassingBuild");
-                    int lastPassingBuildNumber;
-                    Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
-                    String sqlPassingBuild = "SELECT build " +
-                            "FROM caseResults " +
-                            "WHERE job = ? " +
-                            "AND build < ? " +
-                            "AND suite = ? " +
-                            "AND package = ? " +
-                            "AND classname = ? " +
-                            "AND testname = ? " +
-                            "AND errordetails IS NULL " +
-                            "ORDER BY BUILD DESC " +
-                            "LIMIT 1";
-                    addSqlAttribute(spanPassingBuild, sqlPassingBuild);
-                    try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
-                         Scope ignore = spanPassingBuild.makeCurrent()) {
-                        addCaseResultToStatement(caseResult, build, statement);
-                        try (ResultSet result = statement.executeQuery()) {
-                            boolean hasPassed = result.next();
-                            if (!hasPassed) {
-                                return theJob.getBuildByNumber(1);
-                            }
-                            lastPassingBuildNumber = result.getInt("build");
+                // Memoized per (build, test identity): Jelly views (e.g. the failed-tests list on the
+                // build/test-report pages) call this once per failing case to show its "failed since"
+                // build, so without caching, a build with many failing cases would issue up to two SQL
+                // queries per case on every single page render.
+                String cacheKey = caseResult.getSuiteResult().getName() + '\0' + caseResult.getPackageName()
+                        + '\0' + caseResult.getClassName() + '\0' + caseResult.getName();
+                return getEntry().getFailedSinceRun(cacheKey, () -> computeFailedSinceRun(span, caseResult));
+            });
+        }
+
+        private Run<?, ?> computeFailedSinceRun(Span span, CaseResult caseResult) {
+            return query(connection -> {
+                var spanPassingBuild = createSpan("lastPassingBuild");
+                int lastPassingBuildNumber;
+                Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
+                String sqlPassingBuild = "SELECT build " +
+                        "FROM caseResults " +
+                        "WHERE job = ? " +
+                        "AND build < ? " +
+                        "AND suite = ? " +
+                        "AND package = ? " +
+                        "AND classname = ? " +
+                        "AND testname = ? " +
+                        "AND errordetails IS NULL " +
+                        "ORDER BY BUILD DESC " +
+                        "LIMIT 1";
+                addSqlAttribute(spanPassingBuild, sqlPassingBuild);
+                try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
+                     Scope ignore = spanPassingBuild.makeCurrent()) {
+                    addCaseResultToStatement(caseResult, build, statement);
+                    try (ResultSet result = statement.executeQuery()) {
+                        boolean hasPassed = result.next();
+                        if (!hasPassed) {
+                            return theJob.getBuildByNumber(1);
                         }
-                    } finally {
-                        spanPassingBuild.end();
+                        lastPassingBuildNumber = result.getInt("build");
                     }
-                    var spanFailingBuild = createSpan("lastFailingBuild");
-                    String sqlFailedBuild = "SELECT build " +
-                            "FROM caseResults " +
-                            "WHERE job = ? " +
-                            "AND build > ? " +
-                            "AND suite = ? " +
-                            "AND package = ? " +
-                            "AND classname = ? " +
-                            "AND testname = ? " +
-                            "AND errordetails is NOT NULL " +
-                            "ORDER BY BUILD ASC " +
-                            "LIMIT 1";
-                    addSqlAttribute(spanFailingBuild, sqlFailedBuild);
-                    try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
-                         Scope ignore = spanFailingBuild.makeCurrent()) {
-                        addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
-                        try (ResultSet result = statement.executeQuery()) {
-                            result.next();
-                            int firstFailingBuildAfterPassing = result.getInt("build");
-                            return theJob.getBuildByNumber(firstFailingBuildAfterPassing);
-                        }
-                    } finally {
-                        spanFailingBuild.end();
+                } finally {
+                    spanPassingBuild.end();
+                }
+                var spanFailingBuild = createSpan("lastFailingBuild");
+                String sqlFailedBuild = "SELECT build " +
+                        "FROM caseResults " +
+                        "WHERE job = ? " +
+                        "AND build > ? " +
+                        "AND suite = ? " +
+                        "AND package = ? " +
+                        "AND classname = ? " +
+                        "AND testname = ? " +
+                        "AND errordetails is NOT NULL " +
+                        "ORDER BY BUILD ASC " +
+                        "LIMIT 1";
+                addSqlAttribute(spanFailingBuild, sqlFailedBuild);
+                try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
+                     Scope ignore = spanFailingBuild.makeCurrent()) {
+                    addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
+                    try (ResultSet result = statement.executeQuery()) {
+                        result.next();
+                        int firstFailingBuildAfterPassing = result.getInt("build");
+                        return theJob.getBuildByNumber(firstFailingBuildAfterPassing);
                     }
-                });
+                } finally {
+                    spanFailingBuild.end();
+                }
             });
         }
 
@@ -748,8 +771,11 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 span.setAttribute("suite", suiteName);
                 log.fine(String.format("Getting suite result for suite %s from case results.", suiteName));
                 SuiteResult suiteResult = new SuiteResult(suiteName, null, null, null);
-                getCaseResults().stream()
-                        .filter(caseResult -> caseResult.getSuiteResult().getName().equals(suiteName))
+                // Looked up by suite name (not iterated), e.g. by CaseResult#getPreviousResult() walking
+                // build history for age/trend computation; use the per-entry suite-name index rather than
+                // scanning every case in the build on each call, which was previously the dominant cost
+                // when many failing cases each walk several historical builds.
+                getEntry().getCasesBySuiteName(span).getOrDefault(suiteName, Collections.emptyList())
                         .forEach(caseResult -> {
                             TestResult testResult = new TestResult(this);
                             String packageName = caseResult.getPackageName();
@@ -871,23 +897,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         @Override
         @CheckForNull
         public TestResult getPreviousResult() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousResult", span -> {
-                var sql = "SELECT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT 1";
-                addSqlAttribute(span, sql);
-                return query(connection -> {
-                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                        statement.setString(1, job);
-                        statement.setInt(2, build);
-                        try (ResultSet result = statement.executeQuery()) {
-                            if (result.next()) {
-                                int previousBuild = result.getInt("build");
-                                return new TestResult(load(job, previousBuild));
-                            }
-                            return null;
-                        }
-                    }
-                });
-            });
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousResult",
+                    span -> getEntry().getPreviousResult(span).orElse(null));
         }
 
         @NonNull
@@ -920,6 +931,35 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         private volatile BuildSummary summary;
         private final Object summaryLock = new Object();
+
+        /**
+         * Case results grouped by suite name, memoized once from {@link #getCaseResults(Span)} so that
+         * repeated single-suite lookups (e.g. {@link #getSuite(Span, String)}, used heavily by
+         * {@link CaseResult#getPreviousResult()} when walking build history for age/trend computation)
+         * are O(1) map lookups instead of an O(n) scan of every case in the build for each lookup.
+         */
+        private volatile Map<String, List<CaseResult>> casesBySuiteName;
+        private final Object casesBySuiteNameLock = new Object();
+
+        /**
+         * Memoized result of looking up the previous build's {@link TestResult}, so that repeated
+         * calls (e.g. one per {@link CaseResult#getPreviousResult()} invocation, which can happen once
+         * per case in a build while walking up to {@code PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX}
+         * builds of history) issue a single "find the previous build" SQL query per cache generation
+         * instead of one query per case. Wrapped in {@link Optional} so that "not yet computed"
+         * ({@code null} field) is distinguishable from "computed, and there is no previous build"
+         * ({@link Optional#empty()}).
+         */
+        private volatile Optional<TestResult> previousResult;
+        private final Object previousResultLock = new Object();
+
+        /**
+         * Memoizes {@link #getFailedSinceRun(String, Supplier)} results per test identity within this
+         * build, so that Jelly views listing many failing cases (each of which looks up its own "failed
+         * since" build) issue at most one pair of SQL queries per unique failing test per cache
+         * generation, instead of repeating them on every render of the same build's page.
+         */
+        private final Map<String, Run<?, ?>> failedSinceRunByTest = new ConcurrentHashMap<>();
 
         /** Cache weight (approximately the case count); 1 until the case list is actually loaded. */
         private volatile int weight = 1;
@@ -963,6 +1003,61 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 }
                 return local;
             }
+        }
+
+        Map<String, List<CaseResult>> getCasesBySuiteName(Span span) {
+            Map<String, List<CaseResult>> local = casesBySuiteName;
+            if (local != null) {
+                return local;
+            }
+            synchronized (casesBySuiteNameLock) {
+                local = casesBySuiteName;
+                if (local == null) {
+                    local = getCaseResults(span).stream()
+                            .collect(Collectors.groupingBy(caseResult -> caseResult.getSuiteResult().getName()));
+                    casesBySuiteName = local;
+                }
+                return local;
+            }
+        }
+
+        Optional<TestResult> getPreviousResult(Span span) {
+            Optional<TestResult> local = previousResult;
+            if (local != null) {
+                return local;
+            }
+            synchronized (previousResultLock) {
+                local = previousResult;
+                if (local == null) {
+                    local = loadPreviousResultFromDB(span);
+                    previousResult = local;
+                }
+                return local;
+            }
+        }
+
+        Run<?, ?> getFailedSinceRun(String testKey, Supplier<Run<?, ?>> computer) {
+            return failedSinceRunByTest.computeIfAbsent(testKey, k -> computer.get());
+        }
+
+        private Optional<TestResult> loadPreviousResultFromDB(Span parentSpan) {
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousResult", span -> {
+                var sql = "SELECT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT 1";
+                addSqlAttribute(span, sql);
+                return query(connection -> {
+                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                        statement.setString(1, job);
+                        statement.setInt(2, build);
+                        try (ResultSet result = statement.executeQuery()) {
+                            if (result.next()) {
+                                int previousBuild = result.getInt("build");
+                                return Optional.of(new TestResult(load(job, previousBuild)));
+                            }
+                            return Optional.empty();
+                        }
+                    }
+                });
+            });
         }
 
         private List<CaseResult> loadCaseResultsFromDB(Span parentSpan) {
