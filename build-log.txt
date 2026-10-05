@@ -1,0 +1,317 @@
+[2026-10-04T22:26:15.907Z] + mvn --batch-mode --show-version --errors --no-transfer-progress --update-snapshots -Dmaven.repo.local=/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533@tmp/m2repo -Dmaven.test.failure.ignore -Dspotbugs.failOnError=false -Dcheckstyle.failOnViolation=false -Dcheckstyle.failsOnError=false -Dpmd.failOnViolation=false -Penable-jacoco -Dset.changelist help:evaluate -Dexpression=changelist -Doutput=/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533@tmp/changelist -P-consume-incrementals -DforkCount=1C clean install
+[2026-10-04T22:26:16.108Z] -XX:-AOTInvokeDynamicLinking -XX:-AOTRecordTraining -XX:-AOTReplayTraining -XX:ConcGCThreads=1 -XX:G1ConcRefinementThreads=4 -XX:InitialHeapSize=517047680 -XX:MarkStackSize=4194304 -XX:MaxHeapSize=8272762880 -XX:MinHeapSize=6815736 -XX:+PrintCommandLineFlags -XX:ReservedCodeCacheSize=251658240 -XX:+SegmentedCodeCache -XX:-THPStackMitigation -XX:+UseCompressedOops -XX:+UseG1GC 
+[2026-10-04T22:26:16.511Z] Apache Maven 3.9.16 (2bdd9fddda4b155ebf8000e807eb73fd829a51d5)
+[2026-10-04T22:26:16.511Z] Maven home: /usr/share/apache-maven-3.9.16
+[2026-10-04T22:26:16.511Z] Java version: 25.0.4.1, vendor: Eclipse Adoptium, runtime: /opt/jdk-25
+[2026-10-04T22:26:16.511Z] Default locale: en_US, platform encoding: UTF-8
+[2026-10-04T22:26:16.511Z] OS name: "linux", version: "6.8.0-1064-aws", arch: "amd64", family: "unix"
+[2026-10-04T22:26:17.921Z] [INFO] Error stacktraces are turned on.
+[2026-10-04T22:26:18.126Z] [INFO] Setting: -Dchangelist=427.v79d56d47083b_ -DscmTag=79d56d47083b8e8cdb434bcb4671da011e463032 -Dproject.build.outputTimestamp=2026-10-04T22:24:26Z
+[2026-10-04T22:26:18.127Z] [INFO] Setting: -DgitHubRepo=timja/jenkins-junit-postgresql-plugin
+[2026-10-04T22:26:18.127Z] [INFO] Scanning for projects...
+[2026-10-04T22:26:18.933Z] [INFO] 
+[2026-10-04T22:26:18.933Z] [INFO] ----------------< io.jenkins.plugins:junit-sql-storage >----------------
+[2026-10-04T22:26:18.933Z] [INFO] Building Junit SQL Storage Plugin 427.v79d56d47083b_
+[2026-10-04T22:26:18.933Z] [INFO]   from pom.xml
+[2026-10-04T22:26:18.934Z] [INFO] --------------------------------[ hpi ]---------------------------------
+[2026-10-04T22:26:18.934Z] [INFO] 
+[2026-10-04T22:26:18.934Z] [INFO] --- help:3.5.2:evaluate (default-cli) @ junit-sql-storage ---
+[2026-10-04T22:26:19.034Z] [INFO] No artifact parameter specified, using 'io.jenkins.plugins:junit-sql-storage:hpi:427.v79d56d47083b_' as project.
+[2026-10-04T22:26:19.035Z] [INFO] Result of evaluation written to: /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533@tmp/changelist
+[2026-10-04T22:26:19.035Z] [INFO] 
+[2026-10-04T22:26:19.035Z] [INFO] ----------------< io.jenkins.plugins:junit-sql-storage >----------------
+[2026-10-04T22:26:19.035Z] [INFO] Building Junit SQL Storage Plugin 427.v79d56d47083b_
+[2026-10-04T22:26:19.037Z] [INFO]   from pom.xml
+[2026-10-04T22:26:19.037Z] [INFO] --------------------------------[ hpi ]---------------------------------
+[2026-10-04T22:26:19.844Z] [INFO] 
+[2026-10-04T22:26:19.844Z] [INFO] --- clean:3.5.0:clean (default-clean) @ junit-sql-storage ---
+[2026-10-04T22:26:19.845Z] [INFO] 
+[2026-10-04T22:26:19.845Z] [INFO] --- hpi:3.1838.va_13472137a_6a_:validate (default-validate) @ junit-sql-storage ---
+[2026-10-04T22:26:19.845Z] [INFO] Created marker file /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/java-level/21
+[2026-10-04T22:26:19.845Z] [INFO] Setting maven.compiler.release to 21
+[2026-10-04T22:26:19.845Z] [INFO] Setting maven.compiler.testRelease to 21
+[2026-10-04T22:26:19.845Z] [WARNING] Skipping enforceBytecodeVersion; will run on next invocation.
+[2026-10-04T22:26:19.845Z] [INFO] 
+[2026-10-04T22:26:19.845Z] [INFO] --- hpi:3.1838.va_13472137a_6a_:validate-hpi (default-validate-hpi) @ junit-sql-storage ---
+[2026-10-04T22:26:20.656Z] [INFO] 
+[2026-10-04T22:26:20.657Z] [INFO] --- enforcer:3.6.3:enforce (display-info) @ junit-sql-storage ---
+[2026-10-04T22:26:20.760Z] [INFO] Rule 0: org.apache.maven.enforcer.rules.version.RequireMavenVersion passed
+[2026-10-04T22:26:20.761Z] [INFO] Rule 1: org.apache.maven.enforcer.rules.version.RequireJavaVersion passed
+[2026-10-04T22:26:20.761Z] [INFO] Rule 2: org.apache.maven.enforcer.rules.version.RequireJavaVersion passed
+[2026-10-04T22:26:20.761Z] [INFO] Rule 3: org.apache.maven.enforcer.rules.RequirePluginVersions passed
+[2026-10-04T22:26:20.865Z] [INFO] Rule 4: org.apache.maven.enforcer.rules.dependency.BannedDependencies passed
+[2026-10-04T22:26:20.865Z] [INFO] Rule 5: org.apache.maven.enforcer.rules.dependency.BannedDependencies passed
+[2026-10-04T22:26:20.865Z] [INFO] Ignoring requireUpperBoundDeps in com.google.code.findbugs:jsr305
+[2026-10-04T22:26:20.865Z] [INFO] Ignoring requireUpperBoundDeps in org.ow2.asm:asm
+[2026-10-04T22:26:20.865Z] [INFO] Rule 6: org.apache.maven.enforcer.rules.dependency.RequireUpperBoundDeps passed
+[2026-10-04T22:26:20.865Z] [INFO] banObsoleteDependencyOverrides skipped
+[2026-10-04T22:26:20.865Z] [INFO] Rule 7: io.jenkins.tools.maven.jenkins_enforcer_rules.BanObsoleteDependencyOverrides passed
+[2026-10-04T22:26:20.865Z] [INFO] 
+[2026-10-04T22:26:20.865Z] [INFO] --- enforcer:3.6.3:enforce (no-snapshots-in-release) @ junit-sql-storage ---
+[2026-10-04T22:26:20.865Z] [INFO] Rule 0: org.apache.maven.enforcer.rules.dependency.RequireReleaseDeps passed
+[2026-10-04T22:26:20.866Z] [INFO] 
+[2026-10-04T22:26:20.866Z] [INFO] --- jacoco:0.8.15:prepare-agent (default) @ junit-sql-storage ---
+[2026-10-04T22:26:20.969Z] [INFO] argLine set to -javaagent:/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533@tmp/m2repo/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/jacoco.exec,excludes=**/Messages.class:org/htmlunit/** -Xms768M -Xmx768M -XX:+HeapDumpOnOutOfMemoryError -XX:+TieredCompilation -XX:TieredStopAtLevel=1 @{jenkins.addOpens} @{jenkins.insaneHook} @{jenkins.javaAgent}
+[2026-10-04T22:26:20.970Z] [INFO] 
+[2026-10-04T22:26:20.970Z] [INFO] --- localizer:1.31:generate (default) @ junit-sql-storage ---
+[2026-10-04T22:26:21.193Z] [INFO] 
+[2026-10-04T22:26:21.193Z] [INFO] --- enforcer:3.6.3:enforce (check-junit-imports) @ junit-sql-storage ---
+[2026-10-04T22:26:21.193Z] [INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[2026-10-04T22:26:21.194Z] [INFO] 
+[2026-10-04T22:26:21.194Z] [INFO] --- enforcer:3.6.3:enforce (check-commons-lang-imports) @ junit-sql-storage ---
+[2026-10-04T22:26:21.194Z] [INFO] Skipping Rule Enforcement.
+[2026-10-04T22:26:21.194Z] [INFO] 
+[2026-10-04T22:26:21.194Z] [INFO] --- enforcer:3.6.3:enforce (check-deprecated-stapler-imports) @ junit-sql-storage ---
+[2026-10-04T22:26:21.196Z] [INFO] Skipping Rule Enforcement.
+[2026-10-04T22:26:21.196Z] [INFO] 
+[2026-10-04T22:26:21.196Z] [INFO] --- resources:3.5.0:resources (default-resources) @ junit-sql-storage ---
+[2026-10-04T22:26:21.196Z] [INFO] Copying 10 resources from src/main/resources to target/classes
+[2026-10-04T22:26:21.197Z] [INFO] 
+[2026-10-04T22:26:21.197Z] [INFO] --- flatten:1.8.0:flatten (flatten) @ junit-sql-storage ---
+[2026-10-04T22:26:21.297Z] [INFO] Generating flattened POM of project io.jenkins.plugins:junit-sql-storage:hpi:427.v79d56d47083b_...
+[2026-10-04T22:26:21.297Z] [INFO] 
+[2026-10-04T22:26:21.298Z] [INFO] --- compiler:3.16.0:compile (default-compile) @ junit-sql-storage ---
+[2026-10-04T22:26:21.398Z] [INFO] Recompiling the module because of changed source code.
+[2026-10-04T22:26:21.398Z] [INFO] Compiling 4 source files with javac [debug parameters release 21] to target/classes
+[2026-10-04T22:26:22.609Z] [INFO] io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage indexed under hudson.Extension
+[2026-10-04T22:26:22.609Z] [INFO] io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.DescriptorImpl indexed under hudson.Extension
+[2026-10-04T22:26:22.609Z] [INFO] io.jenkins.plugins.junit.storage.database.TestResultCleanupListener.RunCleanupListener indexed under hudson.Extension
+[2026-10-04T22:26:22.609Z] [INFO] io.jenkins.plugins.junit.storage.database.TestResultCleanupListener.JobCleanupListener indexed under hudson.Extension
+[2026-10-04T22:26:22.609Z] [INFO] io.jenkins.plugins.junit.storage.database.TestResultCleanupListener.RunCompletionListener indexed under hudson.Extension
+[2026-10-04T22:26:22.609Z] [INFO] /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/main/java/io/jenkins/plugins/junit/storage/database/DatabaseTestResultStorage.java:[201,12] Generating io/jenkins/plugins/junit/storage/database/DatabaseTestResultStorage.stapler
+[2026-10-04T22:26:22.609Z] [INFO] 
+[2026-10-04T22:26:22.609Z] [INFO] --- access-modifier-checker:1.35:enforce (default-enforce) @ junit-sql-storage ---
+[2026-10-04T22:26:22.710Z] [INFO] 
+[2026-10-04T22:26:22.710Z] [INFO] --- bridge-method-injector:1.32:process (default) @ junit-sql-storage ---
+[2026-10-04T22:26:22.710Z] [INFO] 
+[2026-10-04T22:26:22.710Z] [INFO] --- hpi:3.1838.va_13472137a_6a_:insert-test (default-insert-test) @ junit-sql-storage ---
+[2026-10-04T22:26:22.710Z] [INFO] 
+[2026-10-04T22:26:22.710Z] [INFO] --- antrun:3.2.0:run (createTempDir) @ junit-sql-storage ---
+[2026-10-04T22:26:22.911Z] [INFO] Executing tasks
+[2026-10-04T22:26:22.912Z] [INFO]     [mkdir] Created dir: /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/tmp
+[2026-10-04T22:26:22.912Z] [INFO] Executed tasks
+[2026-10-04T22:26:22.913Z] [INFO] 
+[2026-10-04T22:26:22.913Z] [INFO] --- resources:3.5.0:testResources (default-testResources) @ junit-sql-storage ---
+[2026-10-04T22:26:22.914Z] [INFO] Copying 4 resources from src/test/resources to target/test-classes
+[2026-10-04T22:26:22.914Z] [INFO] 
+[2026-10-04T22:26:22.914Z] [INFO] --- compiler:3.16.0:testCompile (default-testCompile) @ junit-sql-storage ---
+[2026-10-04T22:26:22.914Z] [INFO] Recompiling the module because of changed dependency.
+[2026-10-04T22:26:22.914Z] [INFO] Compiling 5 source files with javac [debug parameters release 21] to target/test-classes
+[2026-10-04T22:26:23.616Z] [INFO] /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/test/java/io/jenkins/plugins/junit/storage/database/benchmarks/TrendGraphBenchmark.java: /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/test/java/io/jenkins/plugins/junit/storage/database/benchmarks/TrendGraphBenchmark.java uses or overrides a deprecated API.
+[2026-10-04T22:26:23.617Z] [INFO] /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/test/java/io/jenkins/plugins/junit/storage/database/benchmarks/TrendGraphBenchmark.java: Recompile with -Xlint:deprecation for details.
+[2026-10-04T22:26:23.617Z] [INFO] 
+[2026-10-04T22:26:23.617Z] [INFO] --- hpi:3.1838.va_13472137a_6a_:test-hpl (default-test-hpl) @ junit-sql-storage ---
+[2026-10-04T22:26:23.617Z] [INFO] Generating /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/test-classes/the.hpl
+[2026-10-04T22:26:24.120Z] [INFO] 
+[2026-10-04T22:26:24.120Z] [INFO] --- hpi:3.1838.va_13472137a_6a_:resolve-test-dependencies (default-resolve-test-dependencies) @ junit-sql-storage ---
+[2026-10-04T22:26:24.925Z] [INFO] 
+[2026-10-04T22:26:24.926Z] [INFO] --- hpi:3.1838.va_13472137a_6a_:test-runtime (default-test-runtime) @ junit-sql-storage ---
+[2026-10-04T22:26:24.926Z] [INFO] Setting jenkins.addOpens to --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED
+[2026-10-04T22:26:24.926Z] [INFO] Setting jenkins.insaneHook to --patch-module='java.base=/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/patch-modules/org-netbeans-insane-hook.jar' --add-exports=java.base/org.netbeans.insane.hook=ALL-UNNAMED
+[2026-10-04T22:26:24.926Z] [INFO] Setting jenkins.javaAgent to -javaagent:'/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533@tmp/m2repo/org/mockito/mockito-core/5.23.0/mockito-core-5.23.0.jar'
+[2026-10-04T22:26:24.926Z] [INFO] 
+[2026-10-04T22:26:24.926Z] [INFO] --- surefire:3.6.0:test (default-test) @ junit-sql-storage ---
+[2026-10-04T22:26:25.027Z] [INFO] Surefire report directory: /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/surefire-reports
+[2026-10-04T22:26:25.027Z] [INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[2026-10-04T22:26:25.027Z] [INFO] parallel='none', perCoreThreadCount=true, threadCount=0, useUnlimitedThreads=false, threadCountSuites=0, threadCountClasses=0, threadCountMethods=0, parallelOptimized=true, enableOutErrElements=true, enablePropertiesElement=true
+[2026-10-04T22:26:25.130Z] [INFO] 
+[2026-10-04T22:26:25.131Z] [INFO] -------------------------------------------------------
+[2026-10-04T22:26:25.131Z] [INFO]  T E S T S
+[2026-10-04T22:26:25.131Z] [INFO] -------------------------------------------------------
+[2026-10-04T22:26:27.143Z] [INFO] Running io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorageTest
+[2026-10-04T22:26:27.249Z] [INFO] Running io.jenkins.plugins.junit_sql_storage.InjectedTest
+[2026-10-04T22:26:27.249Z] [INFO] Running io.jenkins.plugins.junit.storage.database.DatabaseJcascTestResultStorageTest
+[2026-10-04T22:26:27.249Z] WARNING: A restricted method in java.lang.System has been called
+[2026-10-04T22:26:27.249Z] WARNING: java.lang.System::load has been called by com.sun.jna.Native in an unnamed module (file:/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533%40tmp/m2repo/net/java/dev/jna/jna/5.18.1/jna-5.18.1.jar)
+[2026-10-04T22:26:27.249Z] WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
+[2026-10-04T22:26:27.250Z] WARNING: Restricted methods will be blocked in a future release unless native access is enabled
+[2026-10-04T22:26:27.250Z] 
+[2026-10-04T22:26:27.350Z] WARNING: A restricted method in java.lang.System has been called
+[2026-10-04T22:26:27.351Z] WARNING: java.lang.System::load has been called by com.sun.jna.Native in an unnamed module (file:/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533%40tmp/m2repo/net/java/dev/jna/jna/5.18.1/jna-5.18.1.jar)
+[2026-10-04T22:26:27.351Z] WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
+[2026-10-04T22:26:27.351Z] WARNING: Restricted methods will be blocked in a future release unless native access is enabled
+[2026-10-04T22:26:27.351Z] 
+[2026-10-04T22:26:27.452Z] WARNING: A restricted method in java.lang.System has been called
+[2026-10-04T22:26:27.452Z] WARNING: java.lang.System::load has been called by com.sun.jna.Native in an unnamed module (file:/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533%40tmp/m2repo/net/java/dev/jna/jna/5.18.1/jna-5.18.1.jar)
+[2026-10-04T22:26:27.452Z] WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
+[2026-10-04T22:26:27.452Z] WARNING: Restricted methods will be blocked in a future release unless native access is enabled
+[2026-10-04T22:26:27.452Z] 
+[2026-10-04T22:26:27.560Z] WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+[2026-10-04T22:26:27.560Z] WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.thoughtworks.xstream.converters.reflection.SunUnsafeReflectionProvider (file:/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533%40tmp/m2repo/com/thoughtworks/xstream/xstream/1.4.21/xstream-1.4.21.jar)
+[2026-10-04T22:26:27.560Z] WARNING: Please consider reporting this to the maintainers of class com.thoughtworks.xstream.converters.reflection.SunUnsafeReflectionProvider
+[2026-10-04T22:26:27.560Z] WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+[2026-10-04T22:26:27.661Z] WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+[2026-10-04T22:26:27.661Z] WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.thoughtworks.xstream.converters.reflection.SunUnsafeReflectionProvider (file:/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533%40tmp/m2repo/com/thoughtworks/xstream/xstream/1.4.21/xstream-1.4.21.jar)
+[2026-10-04T22:26:27.661Z] WARNING: Please consider reporting this to the maintainers of class com.thoughtworks.xstream.converters.reflection.SunUnsafeReflectionProvider
+[2026-10-04T22:26:27.661Z] WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+[2026-10-04T22:26:27.661Z] WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+[2026-10-04T22:26:27.661Z] WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.thoughtworks.xstream.converters.reflection.SunUnsafeReflectionProvider (file:/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533%40tmp/m2repo/com/thoughtworks/xstream/xstream/1.4.21/xstream-1.4.21.jar)
+[2026-10-04T22:26:27.661Z] WARNING: Please consider reporting this to the maintainers of class com.thoughtworks.xstream.converters.reflection.SunUnsafeReflectionProvider
+[2026-10-04T22:26:27.661Z] WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+[2026-10-04T22:26:35.793Z] [INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.554 s -- in io.jenkins.plugins.junit.storage.database.DatabaseJcascTestResultStorageTest
+[2026-10-04T22:26:36.301Z] [INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.070 s -- in io.jenkins.plugins.junit_sql_storage.InjectedTest
+[2026-10-04T22:27:13.377Z] [INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 46.17 s -- in io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorageTest
+[2026-10-04T22:27:13.778Z] [INFO] 
+[2026-10-04T22:27:13.778Z] [INFO] Results:
+[2026-10-04T22:27:13.778Z] [INFO] 
+[2026-10-04T22:27:13.778Z] [INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0
+[2026-10-04T22:27:13.778Z] [INFO] 
+[2026-10-04T22:27:13.778Z] [INFO] 
+[2026-10-04T22:27:13.779Z] [INFO] --- license:210.v568d0b_a_2b_e44:process (default) @ junit-sql-storage ---
+[2026-10-04T22:27:14.983Z] [INFO] Generated /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage/WEB-INF/licenses.xml
+[2026-10-04T22:27:14.984Z] [INFO] 
+[2026-10-04T22:27:14.984Z] [INFO] --- hpi:3.1838.va_13472137a_6a_:hpi (default-hpi) @ junit-sql-storage ---
+[2026-10-04T22:27:14.984Z] [INFO] Generating /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage/META-INF/MANIFEST.MF
+[2026-10-04T22:27:15.085Z] [INFO] Checking for attached .jar artifact ...
+[2026-10-04T22:27:15.085Z] [INFO] Generating jar /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage.jar
+[2026-10-04T22:27:15.086Z] [INFO] Building jar: /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage.jar
+[2026-10-04T22:27:15.086Z] [INFO] Exploding webapp...
+[2026-10-04T22:27:15.086Z] [INFO] Copy webapp webResources to /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage
+[2026-10-04T22:27:15.086Z] [INFO] Assembling webapp junit-sql-storage in /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage
+[2026-10-04T22:27:15.286Z] [INFO] Generating hpi /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage.hpi
+[2026-10-04T22:27:15.287Z] [INFO] Building jar: /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage.hpi
+[2026-10-04T22:27:15.287Z] [INFO] 
+[2026-10-04T22:27:15.287Z] [INFO] --- jar:3.5.1:test-jar (maybe-test-jar) @ junit-sql-storage ---
+[2026-10-04T22:27:15.388Z] [INFO] Skipping packaging of the test-jar
+[2026-10-04T22:27:15.388Z] [INFO] 
+[2026-10-04T22:27:15.390Z] [INFO] --- source:3.4.0:jar-no-fork (attach-sources) @ junit-sql-storage ---
+[2026-10-04T22:27:15.493Z] [INFO] Building jar: /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/junit-sql-storage-sources.jar
+[2026-10-04T22:27:15.493Z] [INFO] 
+[2026-10-04T22:27:15.493Z] [INFO] --- source:3.4.0:test-jar-no-fork (attach-test-sources) @ junit-sql-storage ---
+[2026-10-04T22:27:15.493Z] [INFO] Skipping source per configuration.
+[2026-10-04T22:27:15.493Z] [INFO] 
+[2026-10-04T22:27:15.493Z] [INFO] --- javadoc:3.12.0:jar (attach-javadocs) @ junit-sql-storage ---
+[2026-10-04T22:27:17.604Z] [INFO] ------------------------------------------------------------------------
+[2026-10-04T22:27:17.604Z] [INFO] BUILD FAILURE
+[2026-10-04T22:27:17.605Z] [INFO] ------------------------------------------------------------------------
+[2026-10-04T22:27:17.605Z] [INFO] Total time:  59.760 s
+[2026-10-04T22:27:17.605Z] [INFO] Finished at: 2026-10-04T22:27:17Z
+[2026-10-04T22:27:17.605Z] [INFO] ------------------------------------------------------------------------
+[2026-10-04T22:27:17.605Z] [ERROR] Failed to execute goal org.apache.maven.plugins:maven-javadoc-plugin:3.12.0:jar (attach-javadocs) on project junit-sql-storage: MavenReportException: Error while generating Javadoc: 
+[2026-10-04T22:27:17.605Z] [ERROR] Exit code: 1
+[2026-10-04T22:27:17.605Z] [ERROR] /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/main/java/io/jenkins/plugins/junit/storage/database/TestResultCleanupListener.java:62: error: reference not found
+[2026-10-04T22:27:17.605Z] [ERROR]      * {@link DatabaseTestResultStorage.RemotePublisherImpl} invalidating the cache as soon as its
+[2026-10-04T22:27:17.605Z] [ERROR]               ^
+[2026-10-04T22:27:17.605Z] [ERROR] 1 error
+[2026-10-04T22:27:17.605Z] [ERROR] Command line was: /opt/jdk-25/bin/javadoc -J-Duser.language= -J-Duser.country= @options @packages
+[2026-10-04T22:27:17.605Z] [ERROR] 
+[2026-10-04T22:27:17.605Z] [ERROR] Refer to the generated Javadoc files in '/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/reports/apidocs' dir.
+[2026-10-04T22:27:17.605Z] [ERROR] -> [Help 1]
+[2026-10-04T22:27:17.605Z] org.apache.maven.lifecycle.LifecycleExecutionException: Failed to execute goal org.apache.maven.plugins:maven-javadoc-plugin:3.12.0:jar (attach-javadocs) on project junit-sql-storage: MavenReportException: Error while generating Javadoc: 
+[2026-10-04T22:27:17.605Z] Exit code: 1
+[2026-10-04T22:27:17.605Z] /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/main/java/io/jenkins/plugins/junit/storage/database/TestResultCleanupListener.java:62: error: reference not found
+[2026-10-04T22:27:17.605Z]      * {@link DatabaseTestResultStorage.RemotePublisherImpl} invalidating the cache as soon as its
+[2026-10-04T22:27:17.605Z]               ^
+[2026-10-04T22:27:17.605Z] 1 error
+[2026-10-04T22:27:17.605Z] Command line was: /opt/jdk-25/bin/javadoc -J-Duser.language= -J-Duser.country= @options @packages
+[2026-10-04T22:27:17.605Z] 
+[2026-10-04T22:27:17.605Z] Refer to the generated Javadoc files in '/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/reports/apidocs' dir.
+[2026-10-04T22:27:17.605Z] 
+[2026-10-04T22:27:17.605Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.doExecute2 (MojoExecutor.java:333)
+[2026-10-04T22:27:17.605Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.doExecute (MojoExecutor.java:316)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:212)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:174)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.access$000 (MojoExecutor.java:75)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.MojoExecutor$1.run (MojoExecutor.java:162)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.plugin.DefaultMojosExecutionStrategy.execute (DefaultMojosExecutionStrategy.java:39)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:159)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:105)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:73)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.builder.singlethreaded.SingleThreadedBuilder.build (SingleThreadedBuilder.java:53)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.lifecycle.internal.LifecycleStarter.execute (LifecycleStarter.java:118)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:261)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:173)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.DefaultMaven.execute (DefaultMaven.java:101)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.cli.MavenCli.execute (MavenCli.java:919)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.cli.MavenCli.doMain (MavenCli.java:285)
+[2026-10-04T22:27:17.606Z]     at org.apache.maven.cli.MavenCli.main (MavenCli.java:207)
+[2026-10-04T22:27:17.606Z]     at jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:104)
+[2026-10-04T22:27:17.606Z]     at java.lang.reflect.Method.invoke (Method.java:565)
+[2026-10-04T22:27:17.606Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.launchEnhanced (Launcher.java:255)
+[2026-10-04T22:27:17.606Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.launch (Launcher.java:201)
+[2026-10-04T22:27:17.606Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.mainWithExitCode (Launcher.java:362)
+[2026-10-04T22:27:17.607Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.main (Launcher.java:314)
+[2026-10-04T22:27:17.607Z] Caused by: org.apache.maven.plugin.MojoExecutionException: MavenReportException: Error while generating Javadoc: 
+[2026-10-04T22:27:17.607Z] Exit code: 1
+[2026-10-04T22:27:17.607Z] /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/main/java/io/jenkins/plugins/junit/storage/database/TestResultCleanupListener.java:62: error: reference not found
+[2026-10-04T22:27:17.607Z]      * {@link DatabaseTestResultStorage.RemotePublisherImpl} invalidating the cache as soon as its
+[2026-10-04T22:27:17.607Z]               ^
+[2026-10-04T22:27:17.607Z] 1 error
+[2026-10-04T22:27:17.607Z] Command line was: /opt/jdk-25/bin/javadoc -J-Duser.language= -J-Duser.country= @options @packages
+[2026-10-04T22:27:17.607Z] 
+[2026-10-04T22:27:17.607Z] Refer to the generated Javadoc files in '/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/reports/apidocs' dir.
+[2026-10-04T22:27:17.607Z] 
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.plugins.javadoc.AbstractJavadocMojo.failOnError (AbstractJavadocMojo.java:5941)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.plugins.javadoc.JavadocJarMojo.doExecute (JavadocJarMojo.java:217)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.plugins.javadoc.AbstractJavadocMojo.execute (AbstractJavadocMojo.java:1851)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.plugin.DefaultBuildPluginManager.executeMojo (DefaultBuildPluginManager.java:126)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.doExecute2 (MojoExecutor.java:328)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.doExecute (MojoExecutor.java:316)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:212)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:174)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.access$000 (MojoExecutor.java:75)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.lifecycle.internal.MojoExecutor$1.run (MojoExecutor.java:162)
+[2026-10-04T22:27:17.607Z]     at org.apache.maven.plugin.DefaultMojosExecutionStrategy.execute (DefaultMojosExecutionStrategy.java:39)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:159)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:105)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:73)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.lifecycle.internal.builder.singlethreaded.SingleThreadedBuilder.build (SingleThreadedBuilder.java:53)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.lifecycle.internal.LifecycleStarter.execute (LifecycleStarter.java:118)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:261)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:173)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.DefaultMaven.execute (DefaultMaven.java:101)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.cli.MavenCli.execute (MavenCli.java:919)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.cli.MavenCli.doMain (MavenCli.java:285)
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.cli.MavenCli.main (MavenCli.java:207)
+[2026-10-04T22:27:17.608Z]     at jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:104)
+[2026-10-04T22:27:17.608Z]     at java.lang.reflect.Method.invoke (Method.java:565)
+[2026-10-04T22:27:17.608Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.launchEnhanced (Launcher.java:255)
+[2026-10-04T22:27:17.608Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.launch (Launcher.java:201)
+[2026-10-04T22:27:17.608Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.mainWithExitCode (Launcher.java:362)
+[2026-10-04T22:27:17.608Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.main (Launcher.java:314)
+[2026-10-04T22:27:17.608Z] Caused by: org.apache.maven.reporting.MavenReportException: 
+[2026-10-04T22:27:17.608Z] Exit code: 1
+[2026-10-04T22:27:17.608Z] /home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/src/main/java/io/jenkins/plugins/junit/storage/database/TestResultCleanupListener.java:62: error: reference not found
+[2026-10-04T22:27:17.608Z]      * {@link DatabaseTestResultStorage.RemotePublisherImpl} invalidating the cache as soon as its
+[2026-10-04T22:27:17.608Z]               ^
+[2026-10-04T22:27:17.608Z] 1 error
+[2026-10-04T22:27:17.608Z] Command line was: /opt/jdk-25/bin/javadoc -J-Duser.language= -J-Duser.country= @options @packages
+[2026-10-04T22:27:17.608Z] 
+[2026-10-04T22:27:17.608Z] Refer to the generated Javadoc files in '/home/jenkins/agent/workspace/_junit-sql-storage-plugin_PR-533/target/reports/apidocs' dir.
+[2026-10-04T22:27:17.608Z] 
+[2026-10-04T22:27:17.608Z]     at org.apache.maven.plugins.javadoc.AbstractJavadocMojo.doExecuteJavadocCommandLine (AbstractJavadocMojo.java:5114)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.plugins.javadoc.AbstractJavadocMojo.executeJavadocCommandLine (AbstractJavadocMojo.java:4987)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.plugins.javadoc.AbstractJavadocMojo.executeReport (AbstractJavadocMojo.java:2059)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.plugins.javadoc.JavadocJarMojo.doExecute (JavadocJarMojo.java:215)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.plugins.javadoc.AbstractJavadocMojo.execute (AbstractJavadocMojo.java:1851)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.plugin.DefaultBuildPluginManager.executeMojo (DefaultBuildPluginManager.java:126)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.doExecute2 (MojoExecutor.java:328)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.doExecute (MojoExecutor.java:316)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:212)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:174)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.access$000 (MojoExecutor.java:75)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.MojoExecutor$1.run (MojoExecutor.java:162)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.plugin.DefaultMojosExecutionStrategy.execute (DefaultMojosExecutionStrategy.java:39)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.MojoExecutor.execute (MojoExecutor.java:159)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:105)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject (LifecycleModuleBuilder.java:73)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.builder.singlethreaded.SingleThreadedBuilder.build (SingleThreadedBuilder.java:53)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.lifecycle.internal.LifecycleStarter.execute (LifecycleStarter.java:118)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:261)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.DefaultMaven.doExecute (DefaultMaven.java:173)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.DefaultMaven.execute (DefaultMaven.java:101)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.cli.MavenCli.execute (MavenCli.java:919)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.cli.MavenCli.doMain (MavenCli.java:285)
+[2026-10-04T22:27:17.609Z]     at org.apache.maven.cli.MavenCli.main (MavenCli.java:207)
+[2026-10-04T22:27:17.609Z]     at jdk.internal.reflect.DirectMethodHandleAccessor.invoke (DirectMethodHandleAccessor.java:104)
+[2026-10-04T22:27:17.609Z]     at java.lang.reflect.Method.invoke (Method.java:565)
+[2026-10-04T22:27:17.610Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.launchEnhanced (Launcher.java:255)
+[2026-10-04T22:27:17.610Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.launch (Launcher.java:201)
+[2026-10-04T22:27:17.610Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.mainWithExitCode (Launcher.java:362)
+[2026-10-04T22:27:17.610Z]     at org.codehaus.plexus.classworlds.launcher.Launcher.main (Launcher.java:314)
+[2026-10-04T22:27:17.610Z] [ERROR] 
+[2026-10-04T22:27:17.610Z] [ERROR] Re-run Maven using the -X switch to enable full debug logging.
+[2026-10-04T22:27:17.610Z] [ERROR] 
+[2026-10-04T22:27:17.610Z] [ERROR] For more information about the errors and possible solutions, please read the following articles:
+[2026-10-04T22:27:17.610Z] [ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoExecutionException
+script returned exit code 1

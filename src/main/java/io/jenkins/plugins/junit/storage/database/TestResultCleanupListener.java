@@ -59,7 +59,7 @@ public class TestResultCleanupListener {
      * Final safeguard: makes sure the cached results for a build are refreshed once it is fully
      * finalized, in case some other invalidation path (e.g. a crashed agent that never returned from
      * a remoting call) failed to run. Normal freshness after each {@code junit} step is provided by
-     * {@link DatabaseTestResultStorage.RemotePublisherImpl} invalidating the cache as soon as its
+     * {@code DatabaseTestResultStorage}'s remote publisher invalidating the cache as soon as its
      * publish call returns.
      */
     @Extension
