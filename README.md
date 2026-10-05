@@ -133,66 +133,9 @@ acktrace |         timestamp
 
 ## Reproducing issues
 
-### Issue #532: running-build test report reloads all test cases from the database on every call
+### Performance
 
-[examples/issue-532/Jenkinsfile](examples/issue-532/Jenkinsfile) is a self-contained Pipeline that
-reproduces [#532](https://github.com/jenkinsci/junit-sql-storage-plugin/issues/532): while a build is
-still running, viewing its build page or "Test Result" page repeatedly reloads every test case from the
-database because the result caches are invalidated on every access while `run.isBuilding()` is `true`.
-
-Prerequisites:
-
-- Jenkins configured with the JUnit SQL Storage plugin against a SQL database (MySQL or PostgreSQL).
-- An agent with Python 3 and network connectivity to the configured database, matching the `AGENT_LABEL`
-  parameter (defaults to `agent`).
-
-Usage:
-
-1. Create a Pipeline job and paste in the Jenkinsfile (or point the job at this file via "Pipeline script
-   from SCM").
-2. Run with the default `smoke` profile first (1,320 test cases across 38 packages, published by 4
-   parallel `junit` steps) to validate the setup.
-3. Switch the `PROFILE` parameter to `issue` to reproduce the exact dataset size from the report: 132,211
-   test cases across 3,808 packages, published by 16 parallel `junit` steps.
-4. Once publishing finishes, the build pauses at an `input` step (without holding an agent executor) for
-   up to 30 minutes. While paused, repeatedly open the build page and its `testReport/` page, and watch
-   the controller log for repeated `Loaded N package results from case results` / `Loaded N test cases
-   from database` messages attributable to a single page view.
-5. Click "Finish build" (or let the pause time out) to let the build complete, then reload the same pages
-   to compare behavior once the cache is no longer invalidated on every access.
-
-> [!WARNING]
-> Only run the `issue` profile against a disposable Jenkins instance/job: it is designed to stress the
-> controller and database in the same way as the original report.
-
-As of the fix for #532, each build's test cases, package results, and pass/fail/skip/duration summary are
-cached per-build (keyed by job name and build number) and loaded from the database at most once; the cache
-is invalidated as soon as a `junit` step publishes new results for that build (not on every read), with a
-ten-minute time-based expiry as a safety net (long enough that it won't lapse mid-render of even a very
-large build's page, which would otherwise force an identical, equally slow reload on the next request).
-The summary counts/duration are computed with a single SQL aggregate query rather than by iterating the
-full case list, so viewing a running build's "Test Result" page repeatedly no longer triggers repeated
-full reloads of every test case.
-
-Because several builds' full case lists (including stdout/stderr/stack traces) can now be resident in
-memory at once, the cache is also bounded by total cached test-case count (summed across all cached
-builds), not just entry count, so that a handful of very large builds viewed around the same time cannot
-exceed a bounded heap budget. The default budget is 500,000 cases; override it with the
-`io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.maxCachedCaseResults` system property
-if your deployment's heap size and typical stdout/stderr payload sizes call for a different value. This
-bound must comfortably exceed the size of a single large build: computing a test's "age" (`CaseResult
-.getPreviousResult()`) walks up to 25 historical builds by default, each of which needs its own case list
-resident at the same time as the current build's, so a budget too close to (or below) one large build's
-case count causes repeated evict-and-reload thrashing between the current and historical builds' entries
-instead of bounding memory cheaply.
-
-`DatabaseTestResultStorage`'s own per-build case/package/summary caching, a `getSuite(name)` lookup
-that is now backed by a memoized per-suite index rather than a full linear scan of every case in the
-build, a memoized "previous build" lookup, and a memoized per-test "failed since" lookup, are all relied
-on heavily by `CaseResult.getPreviousResult()`'s historical-build walk and `CaseResult.getFailedSinceRun()`
-(used to compute test "age"/"failed since", and called once per test case by views that list failing
-tests); each of these is now cached per build so that repeated calls (potentially once per test case)
-reuse a single query per cache generation instead of one (or two) queries per case.
+[examples/issue-532/Jenkinsfile](examples/issue-532/Jenkinsfile) is a self-contained Pipeline that can create a large number of test results to help reproduce performance issues.
 
 ## Contributing
 
