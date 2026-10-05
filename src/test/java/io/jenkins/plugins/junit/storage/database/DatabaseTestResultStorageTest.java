@@ -406,7 +406,7 @@ class DatabaseTestResultStorageTest {
         var connection = Mockito.mock(Connection.class);
         Mockito.when(databaseTestResultStorage.connectionSupplier.connection()).thenReturn(connection);
         var preparedStatement = Mockito.mock(PreparedStatement.class);
-        Mockito.when(connection.prepareStatement(Mockito.anyString())).thenReturn(preparedStatement);
+        Mockito.when(connection.prepareStatement(Mockito.contains("SELECT suite, package"))).thenReturn(preparedStatement);
         List<CaseResult> expectedCaseResults = getCaseResults("package1", "class11", 1, 1, 1);
         expectedCaseResults.addAll(getCaseResults("package1", "class12", 2, 0, 0));
         expectedCaseResults.addAll(getCaseResults("package2", "class21", 3, 0, 2));
@@ -414,7 +414,20 @@ class DatabaseTestResultStorageTest {
         var resultSet = mockResultSet(expectedCaseResults);
         Mockito.when(preparedStatement.executeQuery()).thenReturn(resultSet);
 
-        String job = "jobName";
+        // The aggregate summary (used by getPassCount/getFailCount/getSkipCount/getTotalCount) is
+        // computed via a dedicated SQL query, not by reloading the full case list.
+        var summaryStatement = Mockito.mock(PreparedStatement.class);
+        Mockito.when(connection.prepareStatement(Mockito.contains("SELECT COUNT(*)"))).thenReturn(summaryStatement);
+        var summaryResultSet = Mockito.mock(ResultSet.class);
+        Mockito.when(summaryResultSet.next()).thenReturn(true);
+        Mockito.when(summaryResultSet.getInt("total")).thenReturn(10);
+        Mockito.when(summaryResultSet.getInt("passcount")).thenReturn(6);
+        Mockito.when(summaryResultSet.getInt("failcount")).thenReturn(1);
+        Mockito.when(summaryResultSet.getInt("skipcount")).thenReturn(3);
+        Mockito.when(summaryResultSet.getFloat("totalduration")).thenReturn(1.0f);
+        Mockito.when(summaryStatement.executeQuery()).thenReturn(summaryResultSet);
+
+        String job = "jobName-mockDatabase";
         int build = 1;
 
         // When
@@ -475,9 +488,83 @@ class DatabaseTestResultStorageTest {
         actualPassedTestsByPackage = testResultStorage.getPassedTestsByPackage("package2");
         verifyCaseResultsMatch("passed tests by package2", expectedPassedTestsByPackage, actualPassedTestsByPackage);
 
+        assertEquals(10, testResultStorage.getTotalCount(), "Unexpected total count");
+
+        // Full case list and aggregate summary are each loaded from the database at most once per
+        // build, no matter how many times the various accessors above are called.
         Mockito.verify(preparedStatement, Mockito.times(1)).executeQuery();
+        Mockito.verify(summaryStatement, Mockito.times(1)).executeQuery();
     }
 
+    @Test
+    void getCaseResults_cacheInvalidation_mockDatabase() throws SQLException {
+        // Given: a cache entry is populated for a build, as happens repeatedly while a build is
+        // still running and its progressive test results page is polled.
+        var databaseTestResultStorage = new DatabaseTestResultStorage();
+        databaseTestResultStorage.connectionSupplier = Mockito.mock(DatabaseTestResultStorage.ConnectionSupplier.class);
+        var connection = Mockito.mock(Connection.class);
+        Mockito.when(databaseTestResultStorage.connectionSupplier.connection()).thenReturn(connection);
+        var preparedStatement = Mockito.mock(PreparedStatement.class);
+        Mockito.when(connection.prepareStatement(Mockito.contains("SELECT suite, package"))).thenReturn(preparedStatement);
+
+        List<CaseResult> firstCaseResults = getCaseResults("package1", "class11", 1, 0, 0);
+        var firstResultSet = mockResultSet(firstCaseResults);
+        Mockito.when(preparedStatement.executeQuery()).thenReturn(firstResultSet);
+
+        // Use a job name unique to this test: the results cache is a static, process-wide cache, so
+        // reusing a (job, build) pair from another test could pick up its leftover cache entry.
+        String job = "jobName-cacheInvalidation";
+        int build = 1;
+        var testResultStorage = (DatabaseTestResultStorage.TestResultStorage) databaseTestResultStorage.load(job, build);
+
+        List<CaseResult> firstRead = testResultStorage.getCaseResults();
+        assertEquals(1, firstRead.size());
+
+        // Repeated reads of the same build while it's still running (e.g. polling the UI) must not
+        // re-query the database, since nothing has published a new invalidation yet.
+        List<CaseResult> secondRead = testResultStorage.getCaseResults();
+        assertEquals(1, secondRead.size());
+        Mockito.verify(preparedStatement, Mockito.times(1)).executeQuery();
+
+        // When: new results are published for the same build (e.g. junit step runs again as the
+        // build progresses), the cache must be invalidated so the next read picks up fresh data.
+        List<CaseResult> secondCaseResults = getCaseResults("package1", "class11", 2, 0, 0);
+        var secondResultSet = mockResultSet(secondCaseResults);
+        Mockito.when(preparedStatement.executeQuery()).thenReturn(secondResultSet);
+        DatabaseTestResultStorage.invalidate(job, build);
+
+        // Then
+        List<CaseResult> thirdRead = testResultStorage.getCaseResults();
+        assertEquals(2, thirdRead.size(), "Cache was not refreshed after invalidation");
+        Mockito.verify(preparedStatement, Mockito.times(2)).executeQuery();
+    }
+
+    @Test
+    void getCaseResults_jobNameIsolation_mockDatabase() throws SQLException {
+        // Given: two jobs whose names share a prefix, to guard against the cache key matching by
+        // prefix rather than exact job name.
+        var databaseTestResultStorage = new DatabaseTestResultStorage();
+        databaseTestResultStorage.connectionSupplier = Mockito.mock(DatabaseTestResultStorage.ConnectionSupplier.class);
+        var connection = Mockito.mock(Connection.class);
+        Mockito.when(databaseTestResultStorage.connectionSupplier.connection()).thenReturn(connection);
+        var preparedStatement = Mockito.mock(PreparedStatement.class);
+        Mockito.when(connection.prepareStatement(Mockito.contains("SELECT suite, package"))).thenReturn(preparedStatement);
+
+        List<CaseResult> fooCaseResults = getCaseResults("package1", "class11", 1, 0, 0);
+        var fooResultSet = mockResultSet(fooCaseResults);
+        Mockito.when(preparedStatement.executeQuery()).thenReturn(fooResultSet);
+
+        var fooStorage = (DatabaseTestResultStorage.TestResultStorage) databaseTestResultStorage.load("foo", 1);
+        assertEquals(1, fooStorage.getCaseResults().size());
+
+        // When: the cache for the differently-named job "foobar" is invalidated, it must not affect
+        // the already-cached entry for "foo".
+        DatabaseTestResultStorage.invalidateJob("foobar");
+
+        // Then
+        fooStorage.getCaseResults();
+        Mockito.verify(preparedStatement, Mockito.times(1)).executeQuery();
+    }
 
     private void printCaseResultsTable() throws Exception {
         printAndVerifyCaseResultsTable(false);

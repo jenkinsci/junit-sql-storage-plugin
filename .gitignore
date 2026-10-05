@@ -14,3 +14,4 @@ work
 .classpath
 .project
 jmh-report.json
+build-log.txt

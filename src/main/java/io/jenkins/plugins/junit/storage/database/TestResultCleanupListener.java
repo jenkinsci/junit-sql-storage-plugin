@@ -54,4 +54,23 @@ public class TestResultCleanupListener {
             }
         }
     }
+
+    /**
+     * Final safeguard: makes sure the cached results for a build are refreshed once it is fully
+     * finalized, in case some other invalidation path (e.g. a crashed agent that never returned from
+     * a remoting call) failed to run. Normal freshness after each {@code junit} step is provided by
+     * {@code DatabaseTestResultStorage}'s remote publisher invalidating the cache as soon as its
+     * publish call returns.
+     */
+    @Extension
+    public static class RunCompletionListener extends RunListener<Run> {
+        @Override
+        public void onFinalized(Run run) {
+            JunitTestResultStorage junitTestResultStorage = JunitTestResultStorage.find();
+            if (junitTestResultStorage instanceof DatabaseTestResultStorage) {
+                DatabaseTestResultStorage.invalidate(run.getParent().getFullName(), run.getNumber());
+            }
+        }
+    }
 }
+

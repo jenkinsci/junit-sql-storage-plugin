@@ -8,11 +8,14 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -29,6 +32,7 @@ import hudson.Util;
 import hudson.model.Job;
 import hudson.model.Run;
 import hudson.model.TaskListener;
+import hudson.remoting.Channel;
 import hudson.tasks.junit.CaseResult;
 import hudson.tasks.junit.ClassResult;
 import hudson.tasks.junit.HistoryTestResultSummary;
@@ -46,6 +50,7 @@ import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Scope;
 import jenkins.model.Jenkins;
+import jenkins.security.SlaveToMasterCallable;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.database.Database;
@@ -72,18 +77,121 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     /** The maximum size of a batch to store to the database, used when publishing */
     static final int MAX_DB_BATCH_SIZE = 2000;
 
-    private static final Cache<String, List<CaseResult>> caseResultsCache = Caffeine.newBuilder()
-            .expireAfterAccess(1, TimeUnit.MINUTES)
-            .maximumSize(100)
-            .removalListener((String key, List<CaseResult> ignore, RemovalCause cause) ->
-                    log.config(String.format("Key '%s' removed from caseResultsCache because (%s)", key, cause)))
+    /**
+     * Upper bound on the total number of {@link CaseResult}s kept resident across all cached builds
+     * at once, used as the {@link Caffeine#maximumWeight} for {@link #resultsCache}. Entries are
+     * weighed by case count (a proxy for memory footprint, since per-case payloads such as stdout/
+     * stderr/stack traces dominate) rather than by entry count, so that e.g. a handful of very large
+     * builds (as can happen when several running builds with big suites are viewed around the same
+     * time) cannot together exceed a bounded heap budget. Overridable (system property, in number of
+     * test cases) for unusually large or small deployments/heaps; defaults conservatively since a
+     * single case can carry up to several hundred KB of stdout/stderr/stack trace text.
+     * <p>Note this bound must comfortably exceed the size of a single large build, since computing
+     * test "age"/"failed since" ({@link CaseResult#getPreviousResult()}) walks up to
+     * {@code PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX} (25 by default) historical builds, each of
+     * which needs its own case list resident at the same time as the current build's; setting this
+     * too close to (or below) the size of one large build causes repeated evict-and-reload thrashing
+     * between the current and historical builds' entries, which is far slower than either bound.
+     */
+    private static final long MAX_CACHED_CASE_RESULTS =
+            Long.getLong(DatabaseTestResultStorage.class.getName() + ".maxCachedCaseResults", 500_000L);
+
+    /**
+     * A single cache of per-build results, keyed by exact job/build identity.
+     * <p>Entries use a fixed expiry from creation (not sliding on access) as a safety net: normal
+     * freshness is provided by explicit {@link #invalidate(String, int)} calls after publishing,
+     * deletion, and build completion, so this expiry only matters if an invalidation is ever missed.
+     * It intentionally comfortably exceeds how long even a very large build's page can take to render
+     * (including the per-case "failed since"/age lookups below), since an entry expiring mid-request
+     * would otherwise force an identical, equally slow reload on every subsequent request as well. An
+     * entry lazily and independently memoizes the full case list, the derived package list, the
+     * SQL-computed summary (counts/duration), the previous build lookup, and per-case "failed since"
+     * results, so that repeated accessors sharing a build only trigger one load of each kind per cache
+     * generation, including for running or empty-result builds.
+     */
+    private static final Cache<CacheKey, ResultsEntry> resultsCache = Caffeine.newBuilder()
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .maximumWeight(MAX_CACHED_CASE_RESULTS)
+            .weigher((CacheKey key, ResultsEntry entry) -> entry.weight())
+            .removalListener((CacheKey key, ResultsEntry ignore, RemovalCause cause) ->
+                    log.config(String.format("Key '%s' removed from resultsCache because (%s)", key, cause)))
             .build();
-    private static final Cache<String, List<PackageResult>> packageResultsCache = Caffeine.newBuilder()
-            .expireAfterAccess(1, TimeUnit.MINUTES)
-            .maximumSize(100)
-            .removalListener((String key, List<PackageResult> ignore, RemovalCause cause) ->
-                    log.config(String.format("Key '%s' removed from packageResultsCache because (%s)", key, cause)))
-            .build();
+
+    /** Invalidates the cached results for one build, e.g. after a publisher finishes writing to it. */
+    static void invalidate(String job, int build) {
+        resultsCache.invalidate(new CacheKey(job, build));
+    }
+
+    /** Invalidates the cached results for every build of a job, e.g. when the job itself is deleted. */
+    static void invalidateJob(String job) {
+        resultsCache.asMap().keySet().stream()
+                .filter(key -> key.job.equals(job))
+                .forEach(resultsCache::invalidate);
+    }
+
+    private static final class CacheKey {
+        private final String job;
+        private final int build;
+
+        CacheKey(String job, int build) {
+            this.job = job;
+            this.build = build;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof CacheKey)) {
+                return false;
+            }
+            CacheKey other = (CacheKey) o;
+            return build == other.build && job.equals(other.job);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(job, build);
+        }
+
+        @Override
+        public String toString() {
+            return job + " #" + build;
+        }
+    }
+
+    /** Counts and total duration for one build, computed by a single SQL aggregate query. */
+    private static final class BuildSummary {
+        private final int total;
+        private final int passed;
+        private final int failed;
+        private final int skipped;
+        private final float duration;
+
+        BuildSummary(int total, int passed, int failed, int skipped, float duration) {
+            this.total = total;
+            this.passed = passed;
+            this.failed = failed;
+            this.skipped = skipped;
+            this.duration = duration;
+        }
+    }
+
+    /** Callable sent from an agent back to the controller to invalidate the controller-side cache. */
+    private static final class InvalidateCacheCallable extends SlaveToMasterCallable<Void, RuntimeException> {
+        private static final long serialVersionUID = 1L;
+        private final String job;
+        private final int build;
+
+        InvalidateCacheCallable(String job, int build) {
+            this.job = job;
+            this.build = build;
+        }
+
+        @Override
+        public Void call() {
+            DatabaseTestResultStorage.invalidate(job, build);
+            return null;
+        }
+    }
 
     transient ConnectionSupplier  connectionSupplier;
 
@@ -158,6 +266,45 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         @Override
         public void publish(TestResult result, TaskListener listener) throws IOException {
+            IOException publishFailure = null;
+            try {
+                doPublish(result);
+            } catch (IOException x) {
+                publishFailure = x;
+            }
+            // Always invalidate, even on a partial-write failure, so stale cached results from before
+            // this call are not served while the real database state is now different (or still unknown).
+            try {
+                invalidateCache();
+            } catch (IOException x) {
+                if (publishFailure != null) {
+                    publishFailure.addSuppressed(x);
+                } else {
+                    publishFailure = x;
+                }
+            }
+            if (publishFailure != null) {
+                throw publishFailure;
+            }
+        }
+
+        private void invalidateCache() throws IOException {
+            Channel channel = Channel.current();
+            if (channel != null) {
+                // Running on an agent: call back to the controller, where the cache actually lives.
+                try {
+                    channel.call(new InvalidateCacheCallable(job, build));
+                } catch (InterruptedException x) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(x);
+                }
+            } else {
+                // Running on the controller itself (e.g. a build on the built-in node).
+                DatabaseTestResultStorage.invalidate(job, build);
+            }
+        }
+
+        private void doPublish(TestResult result) throws IOException {
             var publishSpan = createSpan("DatabaseTestResultStorage.RemotePublisherImpl.publish");
             var sql = "INSERT INTO caseResults (job, "
                     + "build, suite, package, className, testName, errorDetails, skipped, duration, stdout, "
@@ -328,166 +475,65 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         List<CaseResult> getCaseResults() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getCaseResults", span -> {
-                var cacheKey = getCacheKey();
-                if (caseResultsCache.asMap().containsKey(cacheKey)) {
-                    log.fine(String.format("Loading case results from cache for '%s'.", cacheKey));
-                }
-                List<CaseResult> caseResults = caseResultsCache.get(cacheKey, key -> loadCaseResultsFromDB(span));
-                if (caseResults.isEmpty()) {
-                    log.fine(String.format("Case results are empty for job %s so invalidating cache.", cacheKey));
-                    caseResultsCache.invalidate(cacheKey);
-                }
-                var run = getRun();
-                if (run != null && run.isBuilding()) {
-                    log.fine(String.format("Build '%s' is still running so invalidating case results cache.", cacheKey));
-                    caseResultsCache.invalidate(cacheKey);
-                }
-                return caseResults;
-            });
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getCaseResults",
+                    span -> getEntry().getCaseResults(span));
         }
 
-        private String getCacheKey() {
-            return job + " #" + build;
-        }
-
-        private List<CaseResult> loadCaseResultsFromDB(Span parentSpan) {
-           return withSpan("DatabaseTestResultStorage.TestResultStorage.loadCaseResultsFromDB", span ->
-                    query(connection -> {
-                        List<CaseResult> results = new ArrayList<>();
-                        var sql = "SELECT suite, package, "
-                                + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
-                                + "FROM caseResults WHERE job = ? AND build = ?";
-                        addSqlAttribute(span, sql);
-                        try (var preparedStatement = connection.prepareStatement(sql)) {
-                            preparedStatement.setString(1, job);
-                            preparedStatement.setInt(2, build);
-                            try (ResultSet resultSet = preparedStatement.executeQuery()) {
-                                Map<String, ClassResult> classResults = new HashMap<>();
-                                TestResult parent = new TestResult(this);
-                                while (resultSet.next()) {
-                                    String packageName = resultSet.getString("package");
-                                    String className = resultSet.getString("classname");
-                                    String testName = resultSet.getString("testname");
-                                    String errorDetails = resultSet.getString("errordetails");
-                                    String suite = resultSet.getString("suite");
-                                    String skipped = resultSet.getString("skipped");
-                                    String stdout = resultSet.getString("stdout");
-                                    String stderr = resultSet.getString("stderr");
-                                    String stacktrace = resultSet.getString("stacktrace");
-                                    float duration = resultSet.getFloat("duration");
-                                    SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
-                                    suiteResult.setParent(parent);
-                                    CaseResult caseResult =
-                                            new CaseResult(suiteResult, className, testName, errorDetails,
-                                                    skipped, duration, stdout, stderr, stacktrace);
-                                    ClassResult classResult = classResults.get(className);
-                                    if (classResult == null) {
-                                        classResult =
-                                                new ClassResult(new PackageResult(new TestResult(this), packageName),
-                                                        className);
-                                    }
-                                    classResult.add(caseResult);
-                                    caseResult.setClass(classResult);
-                                    classResults.put(className, classResult);
-                                    results.add(caseResult);
-                                }
-                                classResults.values().forEach(ClassResult::tally);
-                            }
-                        }
-                        log.info(String.format("Loaded %d test cases from database for '%s #%d'.", results.size(), job,
-                                build));
-                        return results;
-                    }));
+        private ResultsEntry getEntry() {
+            CacheKey key = new CacheKey(job, build);
+            return resultsCache.get(key, k -> new ResultsEntry(k, job, build));
         }
 
         void deleteRun() {
             withSpan("DatabaseTestResultStorage.TestResultStorage.deleteRun", span -> {
                 log.info(String.format("Deleting test results and purging the cache for job %s #%d", job, build));
-                var cacheKey = getCacheKey();
-                caseResultsCache.invalidate(cacheKey);
-                packageResultsCache.invalidate(cacheKey);
-                return query(connection -> {
-                    var sql = "DELETE FROM caseResults WHERE job = ? AND build = ?";
-                    addSqlAttribute(span, sql);
-                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                        statement.setString(1, job);
-                        span.setAttribute("job", job);
-                        statement.setInt(2, build);
-                        span.setAttribute("build", build);
-                        statement.execute();
-                    }
-                    return null;
-                });
+                invalidate(job, build);
+                try {
+                    return query(connection -> {
+                        var sql = "DELETE FROM caseResults WHERE job = ? AND build = ?";
+                        addSqlAttribute(span, sql);
+                        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                            statement.setString(1, job);
+                            span.setAttribute("job", job);
+                            statement.setInt(2, build);
+                            span.setAttribute("build", build);
+                            statement.execute();
+                        }
+                        return null;
+                    });
+                } finally {
+                    // Invalidate again in case a concurrent read populated the cache from rows that
+                    // have now been deleted, between the delete starting and finishing.
+                    invalidate(job, build);
+                }
             });
         }
-
-        private void invalidateCachesForJob(String jobName) {
-            // invalidate all cache entries that start with the job name
-            caseResultsCache.asMap().keySet().stream()
-                    .filter(key -> key.startsWith(jobName))
-                    .forEach(caseResultsCache::invalidate);
-            packageResultsCache.asMap().keySet().stream()
-                    .filter(key -> key.startsWith(jobName))
-                    .forEach(packageResultsCache::invalidate);
-        }
-
 
         void deleteJob() {
             withSpan("DatabaseTestResultStorage.TestResultStorage.deleteJob", span -> {
                 log.info(String.format("Deleting test results and purging the cache for job %s", job));
-                invalidateCachesForJob(job);
-                return query(connection -> {
-                    var sql = "DELETE FROM caseResults WHERE job = ?";
-                    addSqlAttribute(span, sql);
-                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                        statement.setString(1, job);
-                        span.setAttribute("job", job);
-                        statement.execute();
-                    }
-                    return null;
-                });
+                invalidateJob(job);
+                try {
+                    return query(connection -> {
+                        var sql = "DELETE FROM caseResults WHERE job = ?";
+                        addSqlAttribute(span, sql);
+                        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                            statement.setString(1, job);
+                            span.setAttribute("job", job);
+                            statement.execute();
+                        }
+                        return null;
+                    });
+                } finally {
+                    invalidateJob(job);
+                }
             });
         }
 
         @Override
         public List<PackageResult> getAllPackageResults() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getAllPackageResults", span -> {
-                var cacheKey = getCacheKey();
-                if (packageResultsCache.asMap().containsKey(cacheKey)) {
-                    log.fine(String.format("Loading package results from cache for '%s'.", cacheKey));
-                }
-                List<PackageResult> packageResults = packageResultsCache.get(cacheKey, k -> loadPackageResults());
-                if (packageResults.isEmpty()) {
-                    log.fine(String.format("Package results are empty for '%s' so invalidating cache.", cacheKey));
-                    packageResultsCache.invalidate(cacheKey);
-                }
-                var run = getRun();
-                if (run != null && run.isBuilding()) {
-                    log.fine(String.format("Build '%s' is still running so invalidating package results cache.",
-                            cacheKey));
-                    packageResultsCache.invalidate(cacheKey);
-                }
-                return packageResults;
-            });
-        }
-
-        private List<PackageResult> loadPackageResults() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.loadPackageResults", span -> {
-                Map<String, PackageResult> mapOfPackageResults = new TreeMap<>();
-                TestResult testResult = new TestResult(this);
-                getCaseResults().forEach(caseResult -> {
-                    String packageName = caseResult.getPackageName();
-                    PackageResult packageResult = mapOfPackageResults.computeIfAbsent(packageName,
-                            name -> new PackageResult(testResult, name));
-                    packageResult.add(caseResult);
-                });
-                mapOfPackageResults.values().forEach(PackageResult::tally);
-                log.info(String.format("Loaded %d package results from case results for '%s #%d'.",
-                        mapOfPackageResults.size(), job, build));
-                span.setAttribute("numPackages", mapOfPackageResults.size());
-                return new ArrayList<>(mapOfPackageResults.values());
-            });
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getAllPackageResults",
+                    span -> getEntry().getPackageResults(span));
         }
 
         @Override
@@ -621,60 +667,70 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getFailedSinceRun", span -> {
                 span.setAttribute("build", build);
                 span.setAttribute("job", job);
-                return query(connection -> {
-                    var spanPassingBuild = createSpan("lastPassingBuild");
-                    int lastPassingBuildNumber;
-                    Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
-                    String sqlPassingBuild = "SELECT build " +
-                            "FROM caseResults " +
-                            "WHERE job = ? " +
-                            "AND build < ? " +
-                            "AND suite = ? " +
-                            "AND package = ? " +
-                            "AND classname = ? " +
-                            "AND testname = ? " +
-                            "AND errordetails IS NULL " +
-                            "ORDER BY BUILD DESC " +
-                            "LIMIT 1";
-                    addSqlAttribute(spanPassingBuild, sqlPassingBuild);
-                    try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
-                         Scope ignore = spanPassingBuild.makeCurrent()) {
-                        addCaseResultToStatement(caseResult, build, statement);
-                        try (ResultSet result = statement.executeQuery()) {
-                            boolean hasPassed = result.next();
-                            if (!hasPassed) {
-                                return theJob.getBuildByNumber(1);
-                            }
-                            lastPassingBuildNumber = result.getInt("build");
+                // Memoized per (build, test identity): Jelly views (e.g. the failed-tests list on the
+                // build/test-report pages) call this once per failing case to show its "failed since"
+                // build, so without caching, a build with many failing cases would issue up to two SQL
+                // queries per case on every single page render.
+                String cacheKey = caseResult.getSuiteResult().getName() + '\0' + caseResult.getPackageName()
+                        + '\0' + caseResult.getClassName() + '\0' + caseResult.getName();
+                return getEntry().getFailedSinceRun(cacheKey, () -> computeFailedSinceRun(span, caseResult));
+            });
+        }
+
+        private Run<?, ?> computeFailedSinceRun(Span span, CaseResult caseResult) {
+            return query(connection -> {
+                var spanPassingBuild = createSpan("lastPassingBuild");
+                int lastPassingBuildNumber;
+                Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
+                String sqlPassingBuild = "SELECT build " +
+                        "FROM caseResults " +
+                        "WHERE job = ? " +
+                        "AND build < ? " +
+                        "AND suite = ? " +
+                        "AND package = ? " +
+                        "AND classname = ? " +
+                        "AND testname = ? " +
+                        "AND errordetails IS NULL " +
+                        "ORDER BY BUILD DESC " +
+                        "LIMIT 1";
+                addSqlAttribute(spanPassingBuild, sqlPassingBuild);
+                try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
+                     Scope ignore = spanPassingBuild.makeCurrent()) {
+                    addCaseResultToStatement(caseResult, build, statement);
+                    try (ResultSet result = statement.executeQuery()) {
+                        boolean hasPassed = result.next();
+                        if (!hasPassed) {
+                            return theJob.getBuildByNumber(1);
                         }
-                    } finally {
-                        spanPassingBuild.end();
+                        lastPassingBuildNumber = result.getInt("build");
                     }
-                    var spanFailingBuild = createSpan("lastFailingBuild");
-                    String sqlFailedBuild = "SELECT build " +
-                            "FROM caseResults " +
-                            "WHERE job = ? " +
-                            "AND build > ? " +
-                            "AND suite = ? " +
-                            "AND package = ? " +
-                            "AND classname = ? " +
-                            "AND testname = ? " +
-                            "AND errordetails is NOT NULL " +
-                            "ORDER BY BUILD ASC " +
-                            "LIMIT 1";
-                    addSqlAttribute(spanFailingBuild, sqlFailedBuild);
-                    try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
-                         Scope ignore = spanFailingBuild.makeCurrent()) {
-                        addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
-                        try (ResultSet result = statement.executeQuery()) {
-                            result.next();
-                            int firstFailingBuildAfterPassing = result.getInt("build");
-                            return theJob.getBuildByNumber(firstFailingBuildAfterPassing);
-                        }
-                    } finally {
-                        spanFailingBuild.end();
+                } finally {
+                    spanPassingBuild.end();
+                }
+                var spanFailingBuild = createSpan("lastFailingBuild");
+                String sqlFailedBuild = "SELECT build " +
+                        "FROM caseResults " +
+                        "WHERE job = ? " +
+                        "AND build > ? " +
+                        "AND suite = ? " +
+                        "AND package = ? " +
+                        "AND classname = ? " +
+                        "AND testname = ? " +
+                        "AND errordetails is NOT NULL " +
+                        "ORDER BY BUILD ASC " +
+                        "LIMIT 1";
+                addSqlAttribute(spanFailingBuild, sqlFailedBuild);
+                try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
+                     Scope ignore = spanFailingBuild.makeCurrent()) {
+                    addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
+                    try (ResultSet result = statement.executeQuery()) {
+                        result.next();
+                        int firstFailingBuildAfterPassing = result.getInt("build");
+                        return theJob.getBuildByNumber(firstFailingBuildAfterPassing);
                     }
-                });
+                } finally {
+                    spanFailingBuild.end();
+                }
             });
         }
 
@@ -715,8 +771,11 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 span.setAttribute("suite", suiteName);
                 log.fine(String.format("Getting suite result for suite %s from case results.", suiteName));
                 SuiteResult suiteResult = new SuiteResult(suiteName, null, null, null);
-                getCaseResults().stream()
-                        .filter(caseResult -> caseResult.getSuiteResult().getName().equals(suiteName))
+                // Looked up by suite name (not iterated), e.g. by CaseResult#getPreviousResult() walking
+                // build history for age/trend computation; use the per-entry suite-name index rather than
+                // scanning every case in the build on each call, which was previously the dominant cost
+                // when many failing cases each walk several historical builds.
+                getEntry().getCasesBySuiteName(span).getOrDefault(suiteName, Collections.emptyList())
                         .forEach(caseResult -> {
                             TestResult testResult = new TestResult(this);
                             String packageName = caseResult.getPackageName();
@@ -759,41 +818,32 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         @Override
         public float getTotalTestDuration() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getTotalTestDuration", span ->
-                    getCaseResults().stream()
-                    .map(CaseResult::getDuration)
-                    .reduce(Float::sum)
-                    .orElse(0f));
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getTotalTestDuration",
+                    span -> getEntry().getSummary(span).duration);
         }
 
         @Override
         public int getFailCount() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getFailCount", span ->
-                    (int) getCaseResults().stream()
-                    .filter(CaseResult::isFailed)
-                    .count());
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getFailCount",
+                    span -> getEntry().getSummary(span).failed);
         }
 
         @Override
         public int getSkipCount() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getSkipCount", span ->
-                    (int) getCaseResults().stream()
-                            .filter(CaseResult::isSkipped)
-                            .count());
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getSkipCount",
+                    span -> getEntry().getSummary(span).skipped);
         }
 
         @Override
         public int getPassCount() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getPassCount", span ->
-                    (int) getCaseResults().stream()
-                            .filter(CaseResult::isPassed)
-                            .count());
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getPassCount",
+                    span -> getEntry().getSummary(span).passed);
         }
 
         @Override
         public int getTotalCount() {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getTotalCount", span ->
-                    getCaseResults().size());
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getTotalCount",
+                    span -> getEntry().getSummary(span).total);
         }
 
         @Override
@@ -847,6 +897,150 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         @Override
         @CheckForNull
         public TestResult getPreviousResult() {
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousResult",
+                    span -> getEntry().getPreviousResult(span).orElse(null));
+        }
+
+        @NonNull
+        @Override
+        public TestResult getResultByNodes(@NonNull List<String> nodeIds) {
+            return new TestResult(this); // TODO
+        }
+    }
+
+    /**
+     * Holds the lazily-computed, memoized results for one build: the full case list, the package
+     * list derived from it, and the SQL-aggregated summary (counts/duration). Each is computed at
+     * most once per cache generation, regardless of how many {@link TestResultStorage} instances or
+     * accessor calls request it (e.g. the several {@code getXCount()} calls JUnit makes per build).
+     * A new generation is created by {@link #invalidate(String, int)}/{@link #invalidateJob(String)}
+     * evicting this entry from {@link #resultsCache}, or by the fixed one-minute expiry.
+     */
+    private final class ResultsEntry {
+        private final CacheKey key;
+        private final String job;
+        private final int build;
+        /** Used only to build {@link TestResult} parents; any instance for this job/build will do. */
+        private final TestResultStorage self;
+
+        private volatile List<CaseResult> caseResults;
+        private final Object caseResultsLock = new Object();
+
+        private volatile List<PackageResult> packageResults;
+        private final Object packageResultsLock = new Object();
+
+        private volatile BuildSummary summary;
+        private final Object summaryLock = new Object();
+
+        /**
+         * Case results grouped by suite name, memoized once from {@link #getCaseResults(Span)} so that
+         * repeated single-suite lookups (e.g. {@link #getSuite(Span, String)}, used heavily by
+         * {@link CaseResult#getPreviousResult()} when walking build history for age/trend computation)
+         * are O(1) map lookups instead of an O(n) scan of every case in the build for each lookup.
+         */
+        private volatile Map<String, List<CaseResult>> casesBySuiteName;
+        private final Object casesBySuiteNameLock = new Object();
+
+        /**
+         * Memoized result of looking up the previous build's {@link TestResult}, so that repeated
+         * calls (e.g. one per {@link CaseResult#getPreviousResult()} invocation, which can happen once
+         * per case in a build while walking up to {@code PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX}
+         * builds of history) issue a single "find the previous build" SQL query per cache generation
+         * instead of one query per case. Wrapped in {@link Optional} so that "not yet computed"
+         * ({@code null} field) is distinguishable from "computed, and there is no previous build"
+         * ({@link Optional#empty()}).
+         */
+        private volatile Optional<TestResult> previousResult;
+        private final Object previousResultLock = new Object();
+
+        /**
+         * Memoizes {@link #getFailedSinceRun(String, Supplier)} results per test identity within this
+         * build, so that Jelly views listing many failing cases (each of which looks up its own "failed
+         * since" build) issue at most one pair of SQL queries per unique failing test per cache
+         * generation, instead of repeating them on every render of the same build's page.
+         */
+        private final Map<String, Run<?, ?>> failedSinceRunByTest = new ConcurrentHashMap<>();
+
+        /** Cache weight (approximately the case count); 1 until the case list is actually loaded. */
+        private volatile int weight = 1;
+
+        ResultsEntry(CacheKey key, String job, int build) {
+            this.key = key;
+            this.job = job;
+            this.build = build;
+            this.self = new TestResultStorage(job, build);
+        }
+
+        int weight() {
+            return weight;
+        }
+
+        private <T> T query(Querier<T> querier) {
+            try {
+                Connection connection = getConnectionSupplier().connection();
+                return querier.run(connection);
+            } catch (SQLException x) {
+                throw new RuntimeException(x);
+            }
+        }
+
+        List<CaseResult> getCaseResults(Span span) {
+            List<CaseResult> local = caseResults;
+            if (local != null) {
+                return local;
+            }
+            synchronized (caseResultsLock) {
+                local = caseResults;
+                if (local == null) {
+                    local = loadCaseResultsFromDB(span);
+                    caseResults = local;
+                    // The entry was inserted into resultsCache with a placeholder weight of 1 before
+                    // any data was loaded (its actual size wasn't known yet); now that the case list
+                    // is loaded, update the weight and re-insert so Caffeine re-weighs this entry and
+                    // evicts older entries if the cache-wide case-count budget is now exceeded.
+                    weight = Math.max(1, local.size());
+                    resultsCache.put(key, this);
+                }
+                return local;
+            }
+        }
+
+        Map<String, List<CaseResult>> getCasesBySuiteName(Span span) {
+            Map<String, List<CaseResult>> local = casesBySuiteName;
+            if (local != null) {
+                return local;
+            }
+            synchronized (casesBySuiteNameLock) {
+                local = casesBySuiteName;
+                if (local == null) {
+                    local = getCaseResults(span).stream()
+                            .collect(Collectors.groupingBy(caseResult -> caseResult.getSuiteResult().getName()));
+                    casesBySuiteName = local;
+                }
+                return local;
+            }
+        }
+
+        Optional<TestResult> getPreviousResult(Span span) {
+            Optional<TestResult> local = previousResult;
+            if (local != null) {
+                return local;
+            }
+            synchronized (previousResultLock) {
+                local = previousResult;
+                if (local == null) {
+                    local = loadPreviousResultFromDB(span);
+                    previousResult = local;
+                }
+                return local;
+            }
+        }
+
+        Run<?, ?> getFailedSinceRun(String testKey, Supplier<Run<?, ?>> computer) {
+            return failedSinceRunByTest.computeIfAbsent(testKey, k -> computer.get());
+        }
+
+        private Optional<TestResult> loadPreviousResultFromDB(Span parentSpan) {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousResult", span -> {
                 var sql = "SELECT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT 1";
                 addSqlAttribute(span, sql);
@@ -857,19 +1051,145 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         try (ResultSet result = statement.executeQuery()) {
                             if (result.next()) {
                                 int previousBuild = result.getInt("build");
-                                return new TestResult(load(job, previousBuild));
+                                return Optional.of(new TestResult(load(job, previousBuild)));
                             }
-                            return null;
+                            return Optional.empty();
                         }
                     }
                 });
             });
         }
 
-        @NonNull
-        @Override
-        public TestResult getResultByNodes(@NonNull List<String> nodeIds) {
-            return new TestResult(this); // TODO
+        private List<CaseResult> loadCaseResultsFromDB(Span parentSpan) {
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.loadCaseResultsFromDB", span ->
+                    query(connection -> {
+                        List<CaseResult> results = new ArrayList<>();
+                        var sql = "SELECT suite, package, "
+                                + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
+                                + "FROM caseResults WHERE job = ? AND build = ?";
+                        addSqlAttribute(span, sql);
+                        try (var preparedStatement = connection.prepareStatement(sql)) {
+                            preparedStatement.setString(1, job);
+                            preparedStatement.setInt(2, build);
+                            try (ResultSet resultSet = preparedStatement.executeQuery()) {
+                                Map<String, ClassResult> classResults = new HashMap<>();
+                                TestResult parent = new TestResult(self);
+                                while (resultSet.next()) {
+                                    String packageName = resultSet.getString("package");
+                                    String className = resultSet.getString("classname");
+                                    String testName = resultSet.getString("testname");
+                                    String errorDetails = resultSet.getString("errordetails");
+                                    String suite = resultSet.getString("suite");
+                                    String skipped = resultSet.getString("skipped");
+                                    String stdout = resultSet.getString("stdout");
+                                    String stderr = resultSet.getString("stderr");
+                                    String stacktrace = resultSet.getString("stacktrace");
+                                    float duration = resultSet.getFloat("duration");
+                                    SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+                                    suiteResult.setParent(parent);
+                                    CaseResult caseResult =
+                                            new CaseResult(suiteResult, className, testName, errorDetails,
+                                                    skipped, duration, stdout, stderr, stacktrace);
+                                    ClassResult classResult = classResults.get(className);
+                                    if (classResult == null) {
+                                        classResult =
+                                                new ClassResult(new PackageResult(new TestResult(self), packageName),
+                                                        className);
+                                    }
+                                    classResult.add(caseResult);
+                                    caseResult.setClass(classResult);
+                                    classResults.put(className, classResult);
+                                    results.add(caseResult);
+                                }
+                                classResults.values().forEach(ClassResult::tally);
+                            }
+                        }
+                        log.info(String.format("Loaded %d test cases from database for '%s #%d'.", results.size(), job,
+                                build));
+                        return results;
+                    }));
+        }
+
+        List<PackageResult> getPackageResults(Span span) {
+            List<PackageResult> local = packageResults;
+            if (local != null) {
+                return local;
+            }
+            synchronized (packageResultsLock) {
+                local = packageResults;
+                if (local == null) {
+                    local = loadPackageResults(span);
+                    packageResults = local;
+                }
+                return local;
+            }
+        }
+
+        private List<PackageResult> loadPackageResults(Span parentSpan) {
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.loadPackageResults", span -> {
+                Map<String, PackageResult> mapOfPackageResults = new TreeMap<>();
+                TestResult testResult = new TestResult(self);
+                getCaseResults(span).forEach(caseResult -> {
+                    String packageName = caseResult.getPackageName();
+                    PackageResult packageResult = mapOfPackageResults.computeIfAbsent(packageName,
+                            name -> new PackageResult(testResult, name));
+                    packageResult.add(caseResult);
+                });
+                mapOfPackageResults.values().forEach(PackageResult::tally);
+                log.info(String.format("Loaded %d package results from case results for '%s #%d'.",
+                        mapOfPackageResults.size(), job, build));
+                span.setAttribute("numPackages", mapOfPackageResults.size());
+                return new ArrayList<>(mapOfPackageResults.values());
+            });
+        }
+
+        BuildSummary getSummary(Span span) {
+            BuildSummary local = summary;
+            if (local != null) {
+                return local;
+            }
+            synchronized (summaryLock) {
+                local = summary;
+                if (local == null) {
+                    local = loadSummaryFromDB(span);
+                    summary = local;
+                }
+                return local;
+            }
+        }
+
+        private BuildSummary loadSummaryFromDB(Span parentSpan) {
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.loadSummaryFromDB", span ->
+                    query(connection -> {
+                        // skipped takes precedence over fail/pass, matching CaseResult#isSkipped/#isFailed;
+                        // a case fails when not skipped and either errordetails or stacktrace is set, matching
+                        // CaseResult#isPassed (and #isFailed = !isPassed && !isSkipped).
+                        var sql = "SELECT COUNT(*) AS total, "
+                                + "COALESCE(SUM(CASE WHEN skipped IS NOT NULL THEN 1 ELSE 0 END), 0) AS skipcount, "
+                                + "COALESCE(SUM(CASE WHEN skipped IS NULL AND (errordetails IS NOT NULL OR stacktrace IS NOT NULL) "
+                                + "THEN 1 ELSE 0 END), 0) AS failcount, "
+                                + "COALESCE(SUM(CASE WHEN skipped IS NULL AND errordetails IS NULL AND stacktrace IS NULL "
+                                + "THEN 1 ELSE 0 END), 0) AS passcount, "
+                                + "COALESCE(SUM(duration), 0) AS totalduration "
+                                + "FROM caseResults WHERE job = ? AND build = ?";
+                        addSqlAttribute(span, sql);
+                        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                            statement.setString(1, job);
+                            statement.setInt(2, build);
+                            try (ResultSet result = statement.executeQuery()) {
+                                result.next();
+                                int total = result.getInt("total");
+                                int skipped = result.getInt("skipcount");
+                                int failed = result.getInt("failcount");
+                                int passed = result.getInt("passcount");
+                                float duration = result.getFloat("totalduration");
+                                log.info(String.format(
+                                        "Loaded summary (total=%d passed=%d failed=%d skipped=%d) for '%s #%d'.",
+                                        total, passed, failed, skipped, job, build));
+                                return new BuildSummary(total, passed, failed, skipped, duration);
+                            }
+                        }
+                    }));
         }
     }
 

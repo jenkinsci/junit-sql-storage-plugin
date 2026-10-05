@@ -131,6 +131,12 @@ acktrace |         timestamp
 (2 rows)
 ```
 
+## Reproducing issues
+
+### Performance
+
+[examples/issue-532/Jenkinsfile](examples/issue-532/Jenkinsfile) is a self-contained Pipeline that can create a large number of test results to help reproduce performance issues.
+
 ## Contributing
 
 Refer to our [contribution guidelines](https://github.com/jenkinsci/.github/blob/master/CONTRIBUTING.md)
