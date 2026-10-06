@@ -26,6 +26,7 @@ import hudson.model.Label;
 import hudson.model.Result;
 import hudson.slaves.DumbSlave;
 import hudson.tasks.junit.CaseResult;
+import hudson.tasks.junit.HistoryTestResultSummary;
 import hudson.tasks.junit.PackageResult;
 import hudson.tasks.junit.SuiteResult;
 import hudson.tasks.junit.TestDurationResultSummary;
@@ -150,14 +151,23 @@ class DatabaseTestResultStorageTest {
             assertEquals(2, testResultAction.getResult().getSuites().size());
             List<CaseResult> failedTests = testResultAction.getFailedTests();
             assertEquals(2, failedTests.size());
-            final CaseResult klazzTest1 = failedTests.get(0);
+            // CaseResult query results carry no guaranteed ordering (no ORDER BY is used, by design,
+            // to avoid forcing an unnecessary sort on potentially huge result sets), so locate each
+            // expected failure by its class name instead of assuming a fixed position.
+            final CaseResult klazzTest1 = failedTests.stream()
+                    .filter(caseResult -> caseResult.getClassName().equals("Klazz"))
+                    .findFirst()
+                    .orElseThrow();
             assertEquals("Klazz", klazzTest1.getClassName());
             assertEquals("test1", klazzTest1.getName());
             assertEquals("failure", klazzTest1.getErrorDetails());
             assertThat(klazzTest1.getDuration(), is(198.0f));
-            assertEquals("another.Klazz", failedTests.get(1).getClassName());
-            assertEquals("test1", failedTests.get(1).getName());
-            assertEquals("another failure", failedTests.get(1).getErrorDetails());
+            final CaseResult anotherKlazzTest1 = failedTests.stream()
+                    .filter(caseResult -> caseResult.getClassName().equals("another.Klazz"))
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals("test1", anotherKlazzTest1.getName());
+            assertEquals("another failure", anotherKlazzTest1.getErrorDetails());
 
             List<CaseResult> skippedTests = testResultAction.getSkippedTests();
             assertEquals(1, skippedTests.size());
@@ -202,6 +212,19 @@ class DatabaseTestResultStorageTest {
             final List<TestDurationResultSummary> testDurationResultSummary =
                     pluggableStorage.getTestDurationResultSummary();
             assertThat(testDurationResultSummary.get(0).getDuration(), is(200));
+
+            // Reads the same persisted per-build summary as the trend/duration/count calls above,
+            // confirming the accumulated counts from the two separate junit steps in BUILD_PIPELINE
+            // (fail=1 skip=1 pass=1, then fail=1 skip=0 pass=0) are reflected correctly as a single
+            // merged history row for the build.
+            List<HistoryTestResultSummary> historySummary = pluggableStorage.getHistorySummary(0);
+            assertThat(historySummary, hasSize(1));
+            HistoryTestResultSummary historyEntry = historySummary.get(0);
+            assertThat(historyEntry.getFailCount(), is(2));
+            assertThat(historyEntry.getSkipCount(), is(1));
+            assertThat(historyEntry.getPassCount(), is(1));
+            assertThat(historyEntry.getTotalCount(), is(4));
+            assertThat(historyEntry.getDuration(), is(200.0f));
 
             //check storage getSuites method
             Collection<SuiteResult> suiteResults = pluggableStorage.getSuites();
@@ -252,6 +275,11 @@ class DatabaseTestResultStorageTest {
                 int count = result.getInt(1);
                 assertThat(count, is(12));
             }
+            // one caseResultsSummary row per build, regardless of each build having published via
+            // two separate junit steps (see BUILD_PIPELINE): confirms the summary upsert accumulates
+            // into a single row per build rather than one row per publish() call.
+            assertThat(countSummaryRows("p"), is(3));
+
             System.out.println("Deleting a workflowRun...");
             workflowRun.delete();
             Thread.sleep(5000);
@@ -266,6 +294,7 @@ class DatabaseTestResultStorageTest {
                 int anInt = result.getInt(1);
                 assertThat(anInt, is(8));
             }
+            assertThat(countSummaryRows("p"), is(2));
 
             System.out.println("Deleting the workflowJob ...");
             workflowJob.delete();
@@ -279,6 +308,20 @@ class DatabaseTestResultStorageTest {
                 result.next();
                 int anInt = result.getInt(1);
                 assertThat(anInt, is(0));
+            }
+            assertThat(countSummaryRows("p"), is(0));
+        }
+    }
+
+    private int countSummaryRows(String job) throws Exception {
+        try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                .getConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement("SELECT count(*) FROM caseResultsSummary WHERE job = ?")) {
+            statement.setString(1, job);
+            try (ResultSet result = statement.executeQuery()) {
+                result.next();
+                return result.getInt(1);
             }
         }
     }
@@ -564,6 +607,51 @@ class DatabaseTestResultStorageTest {
         // Then
         fooStorage.getCaseResults();
         Mockito.verify(preparedStatement, Mockito.times(1)).executeQuery();
+    }
+
+    @Test
+    void getSuite_doesNotHydrateFullBuild_mockDatabase() throws SQLException {
+        // Given: an uncached build whose full case list has never been loaded. getSuite() is the path
+        // used heavily by CaseResult#getPreviousResult() walking historical builds for age/"failed
+        // since" computation, so it must not force a full-build hydration (all suites, all stdout/
+        // stderr/stacktrace text) just to resolve one suite's cases.
+        var databaseTestResultStorage = new DatabaseTestResultStorage();
+        databaseTestResultStorage.connectionSupplier = Mockito.mock(DatabaseTestResultStorage.ConnectionSupplier.class);
+        var connection = Mockito.mock(Connection.class);
+        Mockito.when(databaseTestResultStorage.connectionSupplier.connection()).thenReturn(connection);
+
+        var suiteStatement = Mockito.mock(PreparedStatement.class);
+        Mockito.when(connection.prepareStatement(
+                Mockito.argThat(sql -> sql != null && sql.contains("SELECT suite, package") && sql.contains("AND suite = ?"))))
+                .thenReturn(suiteStatement);
+        var fullStatement = Mockito.mock(PreparedStatement.class);
+        Mockito.when(connection.prepareStatement(
+                Mockito.argThat(sql -> sql != null && sql.contains("SELECT suite, package") && !sql.contains("AND suite = ?"))))
+                .thenReturn(fullStatement);
+
+        List<CaseResult> suite1Results = getCaseResults("package1", "class11", 1, 0, 0);
+        var suite1ResultSet = mockResultSet(suite1Results);
+        Mockito.when(suiteStatement.executeQuery()).thenReturn(suite1ResultSet);
+        Mockito.when(fullStatement.executeQuery()).thenThrow(
+                new AssertionError("getSuite() must not fall back to a full-build load"));
+
+        String job = "jobName-getSuite";
+        int build = 1;
+        var testResultStorage = (DatabaseTestResultStorage.TestResultStorage) databaseTestResultStorage.load(job, build);
+
+        // When
+        SuiteResult suiteResult = testResultStorage.getSuite(suite1Results.get(0).getSuiteResult().getName());
+
+        // Then: only the narrow, suite-scoped query ran.
+        assertEquals(1, suiteResult.getCases().size());
+        assertEquals(suite1Results.get(0).getName(), suiteResult.getCases().get(0).getName());
+        Mockito.verify(suiteStatement, Mockito.times(1)).executeQuery();
+        Mockito.verify(fullStatement, Mockito.never()).executeQuery();
+
+        // And: looking up the same suite again reuses the already-loaded partial result rather than
+        // issuing a second query.
+        testResultStorage.getSuite(suite1Results.get(0).getSuiteResult().getName());
+        Mockito.verify(suiteStatement, Mockito.times(1)).executeQuery();
     }
 
     private void printCaseResultsTable() throws Exception {

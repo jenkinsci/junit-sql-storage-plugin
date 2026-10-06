@@ -17,6 +17,7 @@ import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
@@ -223,7 +224,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         try {
             log.config("createRemotePublisher() -> calling getConnectionSupplier().connection() for build "
                     + build.getParent().getFullName() + " #" + build.getNumber());
-            getConnectionSupplier().connection(); // make sure we start a local server and create table first
+            // Borrowed purely to make sure a local server is started and the table/schema exists
+            // before publishing begins; must be closed and returned to the pool immediately since
+            // ConnectionSupplier.connection() no longer keeps a connection cached for reuse.
+            try (Connection ignored = getConnectionSupplier().connection()) {
+                // no-op; opening the connection above triggers ConnectionSupplier.initialize()
+            }
         } catch (SQLException x) {
             throw new IOException(x);
         }
@@ -244,6 +250,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     @FunctionalInterface
     private interface Querier<T> {
         T run(Connection connection) throws SQLException;
+    }
+
+    /** Binds parameters onto an already-scoped {@link PreparedStatement}; see {@code loadCaseResultRows}. */
+    @FunctionalInterface
+    private interface SqlBinder {
+        void bind(PreparedStatement statement) throws SQLException;
     }
 
     @Override
@@ -314,6 +326,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     Scope ignore = publishSpan.makeCurrent()) {
                 addSqlAttribute(publishSpan, sql);
                 int count = 0;
+                // Aggregate counts/duration for whichever batch chunk is currently unflushed, so that
+                // caseResultsSummary (see #upsertSummary) can be updated with exactly the rows that
+                // were actually just committed to caseResults in each flush below, including on a
+                // partial-batch failure partway through a large publish.
+                int chunkPassCount = 0;
+                int chunkFailCount = 0;
+                int chunkSkipCount = 0;
+                double chunkDuration = 0;
                 for (SuiteResult suiteResult : result.getSuites()) {
                     for (CaseResult caseResult : suiteResult.getCases()) {
                         statement.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
@@ -336,6 +356,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             statement.setNull(8, Types.VARCHAR);
                         }
                         statement.setFloat(9, caseResult.getDuration());
+                        if (errorDetails != null) {
+                            chunkFailCount++;
+                        } else if (caseResult.isSkipped()) {
+                            chunkSkipCount++;
+                        } else {
+                            chunkPassCount++;
+                        }
+                        chunkDuration += caseResult.getDuration();
                         if (StringUtils.isNotEmpty(caseResult.getStdout())) {
                             statement.setString(10, StringUtils.truncate(caseResult.getStdout(), MAX_STDOUT_LENGTH));
                         } else {
@@ -366,6 +394,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             } finally {
                                 batchSpan.end();
                             }
+                            upsertSummary(connection, publishSpan, chunkPassCount, chunkFailCount, chunkSkipCount,
+                                    chunkDuration);
+                            chunkPassCount = 0;
+                            chunkFailCount = 0;
+                            chunkSkipCount = 0;
+                            chunkDuration = 0;
                         }
                     }
                 }
@@ -382,6 +416,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     } finally {
                         batchSpan.end();
                     }
+                    upsertSummary(connection, publishSpan, chunkPassCount, chunkFailCount, chunkSkipCount,
+                            chunkDuration);
                 }
                 log.info(String.format("Saved %d test cases into database for '%s #%d'.", count, job, build));
             } catch (SQLException x) {
@@ -390,35 +426,100 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 publishSpan.end();
             }
         }
+
+        /**
+         * Incrementally maintains {@code caseResultsSummary}, the persisted per-build aggregate read
+         * by {@code getTrendTestResultSummary}/{@code getTestDurationResultSummary}/
+         * {@code getHistorySummary}/{@code getCountOfBuildsWithTestResults}, so those no longer need
+         * to aggregate every {@code caseResults} row for a job on every call.
+         * <p>Called once per flushed batch chunk (not once per whole publish), with only the counts
+         * for the rows in that chunk, so that a partial-batch failure partway through a large publish
+         * leaves the summary row consistent with whatever was actually committed to
+         * {@code caseResults} rather than silently out of sync. A build can also be published more
+         * than once (e.g. multiple {@code junit} steps, or parallel stages each publishing a subset of
+         * results), so this adds to any existing row rather than replacing it.
+         * <p>Uses a portable update-then-insert pattern (rather than {@code ON CONFLICT}/
+         * {@code ON DUPLICATE KEY UPDATE}, which differ between PostgreSQL and MySQL) so the same SQL
+         * works for both supported databases; on a lost race with a concurrent publish for the same
+         * (job, build) inserting first, retries as an update.
+         */
+        private void upsertSummary(Connection connection, Span span, int passCount, int failCount, int skipCount,
+                double duration) throws SQLException {
+            if (passCount == 0 && failCount == 0 && skipCount == 0) {
+                return;
+            }
+            var updateSql = "UPDATE caseResultsSummary SET passCount = passCount + ?, failCount = failCount + ?, "
+                    + "skipCount = skipCount + ?, duration = duration + ? WHERE job = ? AND build = ?";
+            addSqlAttribute(span, updateSql);
+            try (PreparedStatement update = connection.prepareStatement(updateSql)) {
+                if (executeSummaryUpdate(update, passCount, failCount, skipCount, duration) > 0) {
+                    return;
+                }
+            }
+            var insertSql = "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
+                    + "VALUES (?, ?, ?, ?, ?, ?)";
+            try (PreparedStatement insert = connection.prepareStatement(insertSql)) {
+                insert.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
+                insert.setInt(2, build);
+                insert.setInt(3, passCount);
+                insert.setInt(4, failCount);
+                insert.setInt(5, skipCount);
+                insert.setDouble(6, duration);
+                insert.executeUpdate();
+            } catch (SQLException x) {
+                // Lost a race with a concurrent publish for the same (job, build) that inserted its row
+                // first; retry as an update rather than failing the whole publish.
+                try (PreparedStatement update = connection.prepareStatement(updateSql)) {
+                    if (executeSummaryUpdate(update, passCount, failCount, skipCount, duration) == 0) {
+                        throw x;
+                    }
+                }
+            }
+        }
+
+        private int executeSummaryUpdate(PreparedStatement update, int passCount, int failCount, int skipCount,
+                double duration) throws SQLException {
+            update.setInt(1, passCount);
+            update.setInt(2, failCount);
+            update.setInt(3, skipCount);
+            update.setDouble(4, duration);
+            update.setString(5, StringUtils.truncate(job, MAX_JOB_LENGTH));
+            update.setInt(6, build);
+            return update.executeUpdate();
+        }
     }
 
     public static abstract class ConnectionSupplier implements AutoCloseable {
-
-        private transient Connection connection;
 
         protected abstract Database database();
 
         protected void initialize(Connection connection) throws SQLException {}
 
-        synchronized Connection connection() throws SQLException {
-            if (connection == null || connection.isClosed()) {
-                Connection _connection = database().getDataSource().getConnection();
-                initialize(_connection);
-                connection = _connection;
-            }
-            return connection;
+        /**
+         * Returns a fresh connection borrowed from {@link Database#getDataSource()}'s pool.
+         *
+         * <p>Earlier versions of this class cached a single {@link Connection} for the lifetime of
+         * the supplier and handed that same instance out to every caller. That made every concurrent
+         * controller-side read (every job/build/test-report page view, history/trend query, etc.
+         * across the whole Jenkins instance) share one physical JDBC connection: since a
+         * {@link Connection} cannot safely be used by more than one thread at a time, this silently
+         * serialized all read traffic onto a single connection regardless of how many connections the
+         * underlying pool actually has available&mdash;a cheap, unrelated query could queue for
+         * seconds behind an expensive one just because both happened to go through the same cached
+         * connection. Returning a new (pooled, so normally already-established) connection per call
+         * instead lets independent callers run truly concurrently, up to the pool's configured size.
+         * Callers are expected to close what they get, typically via try-with-resources.
+         */
+        Connection connection() throws SQLException {
+            Connection _connection = database().getDataSource().getConnection();
+            initialize(_connection);
+            return _connection;
         }
 
         @Override
         public void close() {
-            try {
-                if (connection != null) {
-                    connection.close();
-                }
-            } catch (SQLException e) {
-                throw new RuntimeException(e);
-            }
-            connection = null;
+            // No-op: connection() no longer caches a connection to close; each caller is responsible
+            // for closing (returning to the pool) whatever it borrowed from connection().
         }
     }
 
@@ -449,8 +550,67 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             database = GlobalDatabaseConfiguration.get().getDatabase();
         }
 
+        /**
+         * Returns the agent-local canonical {@link Database} for this configuration rather than the
+         * just-deserialized {@code database} field directly.
+         *
+         * <p>{@link Database#getDataSource} lazily creates and caches a brand-new connection pool (up
+         * to 8 JDBC connections by default) in a {@code transient} field the first time it is called
+         * on a given {@link Database} <em>instance</em>. Since this object arrives on the agent via
+         * Java serialization (see {@link SerializableOnlyOverRemoting}), every single remote publish
+         * previously produced a fresh {@link Database} instance with no transient state &mdash; so every
+         * build that published results spun up and permanently leaked a whole new connection pool
+         * (nothing ever calls the underlying {@code BasicDataSource.close()}; {@link Database} exposes
+         * no close hook at all). Verified empirically: N sequential, non-overlapping builds against a
+         * real agent leave N more idle Postgres backends after the fact, forever. Over the lifetime of
+         * a busy controller this eventually exhausts the database's {@code max_connections}.
+         *
+         * <p>Routing through {@link RemoteDatabaseCache} instead reuses the same {@link Database}
+         * (and therefore the same bounded connection pool) for every publish from a given agent JVM
+         * that shares the same connection settings, so the agent-side pool size stays capped at the
+         * datasource's configured maximum no matter how many builds that agent ever runs.
+         */
         @Override protected Database database() {
-            return database;
+            return RemoteDatabaseCache.canonicalize(database);
+        }
+    }
+
+    /**
+     * Caches one {@link Database} (and thus one connection pool) per distinct connection
+     * configuration, per agent JVM, so repeated remote publishes reuse pooled connections instead of
+     * each permanently leaking a brand-new pool. See {@link RemoteConnectionSupplier#database()}.
+     */
+    private static final class RemoteDatabaseCache {
+
+        private static final ConcurrentHashMap<String, Database> CACHE = new ConcurrentHashMap<>();
+
+        private RemoteDatabaseCache() {}
+
+        static Database canonicalize(Database database) {
+            String key = keyFor(database);
+            // Unknown/custom Database implementations without a recognizable key are returned as-is:
+            // no caching, but no change in (correct, if pool-leaking) behavior either.
+            if (key == null) {
+                return database;
+            }
+            return CACHE.computeIfAbsent(key, k -> database);
+        }
+
+        @CheckForNull
+        private static String keyFor(Database database) {
+            if (!(database instanceof org.jenkinsci.plugins.database.AbstractRemoteDatabase)) {
+                return null;
+            }
+            org.jenkinsci.plugins.database.AbstractRemoteDatabase remote =
+                    (org.jenkinsci.plugins.database.AbstractRemoteDatabase) database;
+            return String.join("\u0000",
+                    database.getClass().getName(),
+                    String.valueOf(remote.hostname),
+                    String.valueOf(remote.database),
+                    String.valueOf(remote.username),
+                    hudson.util.Secret.toString(remote.password),
+                    String.valueOf(remote.properties),
+                    String.valueOf(remote.getValidationQuery()));
         }
     }
 
@@ -464,10 +624,11 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         private <T> T query(Querier<T> querier) {
-            try {
-                // TODO move to try-with-resources, whenever I try close this I get (multiple queries needed):
-                // org.postgresql.util.PSQLException: This statement has been closed.
-                Connection connection = getConnectionSupplier().connection();
+            // Each call borrows its own connection from the pool and returns it when done, so
+            // concurrent reads (e.g. several test-report pages rendering at once) run on genuinely
+            // separate connections instead of queueing behind one another; see the Javadoc on
+            // ConnectionSupplier.connection() for why this used to not be the case.
+            try (Connection connection = getConnectionSupplier().connection()) {
                 return querier.run(connection);
             } catch (SQLException x) {
                 throw new RuntimeException(x);
@@ -499,6 +660,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             span.setAttribute("build", build);
                             statement.execute();
                         }
+                        var summarySql = "DELETE FROM caseResultsSummary WHERE job = ? AND build = ?";
+                        addSqlAttribute(span, summarySql);
+                        try (PreparedStatement statement = connection.prepareStatement(summarySql)) {
+                            statement.setString(1, job);
+                            statement.setInt(2, build);
+                            statement.execute();
+                        }
                         return null;
                     });
                 } finally {
@@ -522,6 +690,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             span.setAttribute("job", job);
                             statement.execute();
                         }
+                        var summarySql = "DELETE FROM caseResultsSummary WHERE job = ?";
+                        addSqlAttribute(span, summarySql);
+                        try (PreparedStatement statement = connection.prepareStatement(summarySql)) {
+                            statement.setString(1, job);
+                            statement.execute();
+                        }
                         return null;
                     });
                 } finally {
@@ -540,11 +714,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         public List<TrendTestResultSummary> getTrendTestResultSummary() {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getTrendTestResultSummary", span ->
                 query(connection -> {
-                    var sql = "SELECT build, "
-                            + "sum(case when errorDetails is not null then 1 else 0 end) as failCount, "
-                            + "sum(case when skipped is not null then 1 else 0 end) as skipCount, "
-                            + "sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount "
-                            + "FROM caseResults WHERE job = ? group by build order by build;";
+                    // Reads the persisted per-build summary (maintained incrementally at publish time,
+                    // see RemotePublisherImpl#upsertSummary) instead of aggregating every caseResults
+                    // row for the job on every call, which used to cost proportionally to the job's
+                    // total historical row count rather than its number of builds.
+                    var sql = "SELECT build, passCount, failCount, skipCount "
+                            + "FROM caseResultsSummary WHERE job = ? order by build;";
                     addSqlAttribute(span, sql);
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
@@ -570,9 +745,11 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         @Override
         public List<TestDurationResultSummary> getTestDurationResultSummary() {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getTestDurationResultSummary", span -> query(connection -> {
-                var sql = "SELECT build, sum(duration) as duration "
-                        + "FROM caseResults "
-                        + "WHERE job = ? group by build order by build;";
+                // See getTrendTestResultSummary: reads the persisted summary instead of re-summing
+                // every row for the job.
+                var sql = "SELECT build, duration "
+                        + "FROM caseResultsSummary "
+                        + "WHERE job = ? order by build;";
                 addSqlAttribute(span, sql);
                 try (PreparedStatement statement = connection.prepareStatement(sql)) {
                     statement.setString(1, job);
@@ -581,7 +758,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         List<TestDurationResultSummary> testDurationResultSummaries = new ArrayList<>();
                         while (result.next()) {
                             int buildNumber = result.getInt("build");
-                            int duration = result.getInt("duration");
+                            float duration = result.getFloat("duration");
 
                             testDurationResultSummaries.add(
                                     new TestDurationResultSummary(buildNumber, duration));
@@ -596,13 +773,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getHistorySummary", span -> {
                 span.setAttribute("offset", offset);
                 return query(connection -> {
-                    var sql = "SELECT build, "
-                            + "sum(duration) as duration, "
-                            + "sum(case when errorDetails is not null then 1 else 0 end) as failCount, "
-                            + "sum(case when skipped is not null then 1 else 0 end) as skipCount, "
-                            + "sum(case when errorDetails is null and skipped is null then 1 else 0 end) as passCount "
-                            + "FROM caseResults "
-                            + "WHERE job = ? GROUP BY build ORDER BY build DESC LIMIT 25 OFFSET ?;";
+                    // Reads the persisted summary (one row per build) instead of a GROUP BY over every
+                    // caseResults row for the job. The previous query's LIMIT/OFFSET pagination still
+                    // had to aggregate every row up to the current offset on every page load, so this
+                    // matters increasingly as a job accumulates more history, not just more cases.
+                    var sql = "SELECT build, duration, passCount, failCount, skipCount "
+                            + "FROM caseResultsSummary "
+                            + "WHERE job = ? ORDER BY build DESC LIMIT 25 OFFSET ?;";
                     addSqlAttribute(span, sql);
                     try (PreparedStatement statement = connection.prepareStatement(sql)) {
                         statement.setString(1, job);
@@ -614,7 +791,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             List<HistoryTestResultSummary> historyTestResultSummaries = new ArrayList<>();
                             while (result.next()) {
                                 int buildNumber = result.getInt("build");
-                                int duration = result.getInt("duration");
+                                float duration = result.getFloat("duration");
                                 int passed = result.getInt("passCount");
                                 int failed = result.getInt("failCount");
                                 int skipped = result.getInt("skipCount");
@@ -637,7 +814,9 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         public int getCountOfBuildsWithTestResults() {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getCountOfBuildsWithTestResults", span ->
                     query(connection -> {
-                        var sql = "SELECT COUNT(DISTINCT build) as count FROM caseResults WHERE job = ?;";
+                        // Each build has exactly one row in caseResultsSummary, so a plain count
+                        // replaces a COUNT(DISTINCT build) scan over every caseResults row for the job.
+                        var sql = "SELECT COUNT(*) as count FROM caseResultsSummary WHERE job = ?;";
                         addSqlAttribute(span, sql);
                         try (PreparedStatement statement = connection.prepareStatement(sql)) {
                             statement.setString(1, job);
@@ -772,10 +951,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 log.fine(String.format("Getting suite result for suite %s from case results.", suiteName));
                 SuiteResult suiteResult = new SuiteResult(suiteName, null, null, null);
                 // Looked up by suite name (not iterated), e.g. by CaseResult#getPreviousResult() walking
-                // build history for age/trend computation; use the per-entry suite-name index rather than
-                // scanning every case in the build on each call, which was previously the dominant cost
-                // when many failing cases each walk several historical builds.
-                getEntry().getCasesBySuiteName(span).getOrDefault(suiteName, Collections.emptyList())
+                // up to PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX historical builds per failing test to
+                // compute "age"/"failed since". A single suite is typically a small fraction of a large
+                // build's cases (one of possibly thousands of packages/suites), so prefer any case list or
+                // suite index already resident for this build (e.g. because its own full report was
+                // already rendered, which needs every suite anyway) and otherwise issue a narrow,
+                // suite-scoped query -- instead of hydrating every other suite's cases (and their stdout/
+                // stderr/stacktrace text) purely to resolve one historical suite lookup.
+                getEntry().getCasesForSuite(span, suiteName)
                         .forEach(caseResult -> {
                             TestResult testResult = new TestResult(this);
                             String packageName = caseResult.getPackageName();
@@ -933,13 +1116,35 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         private final Object summaryLock = new Object();
 
         /**
-         * Case results grouped by suite name, memoized once from {@link #getCaseResults(Span)} so that
-         * repeated single-suite lookups (e.g. {@link #getSuite(Span, String)}, used heavily by
-         * {@link CaseResult#getPreviousResult()} when walking build history for age/trend computation)
-         * are O(1) map lookups instead of an O(n) scan of every case in the build for each lookup.
+         * Case results grouped by suite name, memoized once the full case list has actually been loaded
+         * (by {@link #getCaseResults(Span)} or indirectly via {@link #getPackageResults(Span)}/
+         * {@link #getSummary(Span)}} triggering it), so that once a build's full case list is resident
+         * anyway, repeated single-suite lookups (see {@link #getCasesForSuite(Span, String)}) are O(1)
+         * map lookups instead of an O(n) scan of every case in the build for each lookup.
          */
         private volatile Map<String, List<CaseResult>> casesBySuiteName;
         private final Object casesBySuiteNameLock = new Object();
+
+        /**
+         * Narrow, suite-scoped case lists loaded directly from the database without hydrating the rest
+         * of the build, keyed by suite name. Used by {@link #getCasesForSuite(Span, String)} only when
+         * the full case list for this build has <em>not</em> been loaded; populated independently per
+         * suite, so distinct suites looked up before any full load can each be loaded (and cached) with
+         * at most one query, without forcing a full-build load. Once the full case list is loaded,
+         * {@link #casesBySuiteName} becomes authoritative instead and this map is no longer consulted
+         * (existing entries are simply left in place rather than removed, since the full load already
+         * carries a strictly larger weight).
+         */
+        private final Map<String, List<CaseResult>> partialCasesBySuiteName = new ConcurrentHashMap<>();
+
+        /**
+         * Running total of case counts loaded via {@link #partialCasesBySuiteName}, used by
+         * {@link #weight()} as a lower-bound memory proxy before (or absent) a full case-list load. Not
+         * decremented if a suite is ever reloaded (it isn't, since {@link ConcurrentHashMap#computeIfAbsent}
+         * loads each suite name at most once), so this can only grow, matching the "never under-count
+         * retained memory" contract that {@link #weight()} relies on for cache eviction.
+         */
+        private final AtomicInteger partialWeight = new AtomicInteger();
 
         /**
          * Memoized result of looking up the previous build's {@link TestResult}, so that repeated
@@ -972,12 +1177,18 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         int weight() {
-            return weight;
+            // The full case list, once loaded, is authoritative and strictly a superset of whatever
+            // partial/suite-scoped loading happened before it, so prefer it when present.
+            if (caseResults != null) {
+                return weight;
+            }
+            return Math.max(1, partialWeight.get());
         }
 
         private <T> T query(Querier<T> querier) {
-            try {
-                Connection connection = getConnectionSupplier().connection();
+            // See TestResultStorage.query(): borrow/return a connection per call rather than sharing
+            // one cached connection across every concurrent caller.
+            try (Connection connection = getConnectionSupplier().connection()) {
                 return querier.run(connection);
             } catch (SQLException x) {
                 throw new RuntimeException(x);
@@ -1021,6 +1232,58 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             }
         }
 
+        /**
+         * Above this many distinct suites requested narrowly for the same not-yet-fully-loaded build,
+         * fall back to a single full-build load instead of continuing to issue one query per suite.
+         * Bounds the worst case for builds whose failing tests are spread across many suites (e.g. a
+         * historical build walked once per failing test in a large current build): a pathological
+         * fan-out of per-suite queries is capped at this many round trips before paying once for a full
+         * load, rather than growing unbounded with the number of distinct suites ever requested.
+         */
+        private static final int MAX_PARTIAL_SUITES_BEFORE_FULL_LOAD = 25;
+
+        /**
+         * Returns the cases belonging to one suite, preferring whatever is already resident (the full
+         * case list/suite index, if this build's full report has already been loaded for some other
+         * reason) and otherwise issuing a single suite-scoped SQL query rather than hydrating every
+         * other suite's cases (and their stdout/stderr/stacktrace text) purely to resolve one suite.
+         * This is the dominant lookup used by {@link CaseResult#getPreviousResult()} walking historical
+         * builds: it visits one suite of one build at a time, so paying for a full-build load there would
+         * multiply the cost of history/age computation by however many historical builds are walked.
+         * See {@link #MAX_PARTIAL_SUITES_BEFORE_FULL_LOAD} for the fallback once too many distinct
+         * suites have been requested this way for the same build.
+         */
+        List<CaseResult> getCasesForSuite(Span span, String suiteName) {
+            Map<String, List<CaseResult>> bySuiteName = casesBySuiteName;
+            if (bySuiteName != null) {
+                return bySuiteName.getOrDefault(suiteName, Collections.emptyList());
+            }
+            if (caseResults != null) {
+                // The full case list is resident but the suite index hasn't been built yet; build it now
+                // (also serving any other suite lookups against this entry) instead of querying per-suite.
+                return getCasesBySuiteName(span).getOrDefault(suiteName, Collections.emptyList());
+            }
+            if (partialCasesBySuiteName.containsKey(suiteName)
+                    || partialCasesBySuiteName.size() < MAX_PARTIAL_SUITES_BEFORE_FULL_LOAD) {
+                List<CaseResult> loaded = partialCasesBySuiteName.computeIfAbsent(suiteName, name -> {
+                    List<CaseResult> rows = loadCasesForSuiteFromDB(span, name);
+                    partialWeight.addAndGet(Math.max(1, rows.size()));
+                    // Re-insert so Caffeine re-weighs this entry against the cache-wide case-count
+                    // budget, mirroring what a full load does in getCaseResults(Span); without this,
+                    // memory held by narrow suite loads (which can still carry large stdout/stderr/
+                    // stacktrace text) would not count against the cache's weight-based eviction at all.
+                    resultsCache.put(key, this);
+                    return rows;
+                });
+                if (partialCasesBySuiteName.size() < MAX_PARTIAL_SUITES_BEFORE_FULL_LOAD) {
+                    return loaded;
+                }
+                // Threshold just reached: fall through to a full load so any further distinct suites
+                // requested for this build (narrowly or otherwise) are served from the single full load.
+            }
+            return getCasesBySuiteName(span).getOrDefault(suiteName, Collections.emptyList());
+        }
+
         Optional<TestResult> getPreviousResult(Span span) {
             Optional<TestResult> local = previousResult;
             if (local != null) {
@@ -1061,16 +1324,45 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         private List<CaseResult> loadCaseResultsFromDB(Span parentSpan) {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.loadCaseResultsFromDB", span ->
+            var sql = "SELECT suite, package, "
+                    + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
+                    + "FROM caseResults WHERE job = ? AND build = ?";
+            return loadCaseResultRows("DatabaseTestResultStorage.TestResultStorage.loadCaseResultsFromDB", sql,
+                    statement -> {
+                        statement.setString(1, job);
+                        statement.setInt(2, build);
+                    });
+        }
+
+        /**
+         * Narrow counterpart of {@link #loadCaseResultsFromDB(Span)}, scoped to a single suite so that
+         * {@link #getCasesForSuite(Span, String)} need not hydrate every other suite in the build (and
+         * their stdout/stderr/stacktrace text) to resolve one historical suite lookup.
+         */
+        private List<CaseResult> loadCasesForSuiteFromDB(Span parentSpan, String suiteName) {
+            var sql = "SELECT suite, package, "
+                    + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
+                    + "FROM caseResults WHERE job = ? AND build = ? AND suite = ?";
+            return loadCaseResultRows("DatabaseTestResultStorage.TestResultStorage.loadCasesForSuiteFromDB", sql,
+                    statement -> {
+                        statement.setString(1, job);
+                        statement.setInt(2, build);
+                        statement.setString(3, suiteName);
+                    });
+        }
+
+        /**
+         * Shared row-mapping logic for both a full build load and a single-suite load: runs the given
+         * already-scoped query and maps each row into a {@link CaseResult}, wiring up {@link ClassResult}/
+         * {@link PackageResult} parents exactly as the full load always has.
+         */
+        private List<CaseResult> loadCaseResultRows(String spanName, String sql, SqlBinder binder) {
+            return withSpan(spanName, span ->
                     query(connection -> {
                         List<CaseResult> results = new ArrayList<>();
-                        var sql = "SELECT suite, package, "
-                                + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
-                                + "FROM caseResults WHERE job = ? AND build = ?";
                         addSqlAttribute(span, sql);
                         try (var preparedStatement = connection.prepareStatement(sql)) {
-                            preparedStatement.setString(1, job);
-                            preparedStatement.setInt(2, build);
+                            binder.bind(preparedStatement);
                             try (ResultSet resultSet = preparedStatement.executeQuery()) {
                                 Map<String, ClassResult> classResults = new HashMap<>();
                                 TestResult parent = new TestResult(self);
