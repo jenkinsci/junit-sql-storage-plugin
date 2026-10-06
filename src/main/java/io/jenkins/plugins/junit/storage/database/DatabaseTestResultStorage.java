@@ -43,6 +43,7 @@ import hudson.tasks.junit.TestDurationResultSummary;
 import hudson.tasks.junit.TestResult;
 import hudson.tasks.junit.TestResultSummary;
 import hudson.tasks.junit.TrendTestResultSummary;
+import hudson.tasks.test.AbstractTestResultAction;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageDescriptor;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
@@ -799,8 +800,17 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 Job<?, ?> theJob = Jenkins.get().getItemByFullName(getJobName(), Job.class);
                                 if (theJob != null) {
                                     Run<?, ?> run = theJob.getBuildByNumber(buildNumber);
-                                    historyTestResultSummaries.add(
-                                            new HistoryTestResultSummary(run, duration, failed, skipped, passed));
+                                    // A row can exist here for a build whose publish was interrupted
+                                    // before completion (caseResultsSummary is maintained incrementally
+                                    // per flushed batch, not only once the whole build/publish finishes),
+                                    // so the Run may have no AbstractTestResultAction attached yet.
+                                    // HistoryTestResultSummary#getUrl() assumes that action is always
+                                    // present and NPEs otherwise, which breaks the whole job's history
+                                    // chart rather than just this one row - so skip such builds here.
+                                    if (run != null && run.getAction(AbstractTestResultAction.class) != null) {
+                                        historyTestResultSummaries.add(
+                                                new HistoryTestResultSummary(run, duration, failed, skipped, passed));
+                                    }
                                 }
                             }
                             return historyTestResultSummaries;
