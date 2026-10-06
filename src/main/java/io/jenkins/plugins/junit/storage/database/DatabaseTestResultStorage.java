@@ -357,11 +357,19 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             statement.setNull(8, Types.VARCHAR);
                         }
                         statement.setFloat(9, caseResult.getDuration());
+                        // Match the independent errorDetails IS NOT NULL / skipped IS NOT NULL predicates used
+                        // by the migration backfill (see V2026_10_05_2240__case-results-summary.sql) and the
+                        // original per-row aggregate queries, rather than treating them as mutually exclusive,
+                        // so summaries are identical regardless of whether a build was backfilled or published
+                        // after this upgrade.
+                        boolean isSkipped = caseResult.isSkipped();
                         if (errorDetails != null) {
                             chunkFailCount++;
-                        } else if (caseResult.isSkipped()) {
+                        }
+                        if (isSkipped) {
                             chunkSkipCount++;
-                        } else {
+                        }
+                        if (errorDetails == null && !isSkipped) {
                             chunkPassCount++;
                         }
                         chunkDuration += caseResult.getDuration();
@@ -513,7 +521,19 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          */
         Connection connection() throws SQLException {
             Connection _connection = database().getDataSource().getConnection();
-            initialize(_connection);
+            try {
+                initialize(_connection);
+            } catch (SQLException | RuntimeException e) {
+                // initialize() failed after a connection was already borrowed from the pool: close it
+                // here (returning it to the pool) since the caller never receives it and therefore has
+                // no way to close it themselves, then rethrow so the original failure is preserved.
+                try {
+                    _connection.close();
+                } catch (SQLException closeException) {
+                    e.addSuppressed(closeException);
+                }
+                throw e;
+            }
             return _connection;
         }
 
@@ -604,12 +624,15 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             }
             org.jenkinsci.plugins.database.AbstractRemoteDatabase remote =
                     (org.jenkinsci.plugins.database.AbstractRemoteDatabase) database;
+            // Use the Secret's encrypted representation (stable per-value, but not reversible to
+            // plaintext) rather than the decrypted password, so the password never lives
+            // indefinitely in plaintext as part of this static cache key (e.g. in heap dumps).
             return String.join("\u0000",
                     database.getClass().getName(),
                     String.valueOf(remote.hostname),
                     String.valueOf(remote.database),
                     String.valueOf(remote.username),
-                    hudson.util.Secret.toString(remote.password),
+                    remote.password == null ? "null" : remote.password.getEncryptedValue(),
                     String.valueOf(remote.properties),
                     String.valueOf(remote.getValidationQuery()));
         }
@@ -652,21 +675,35 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 invalidate(job, build);
                 try {
                     return query(connection -> {
-                        var sql = "DELETE FROM caseResults WHERE job = ? AND build = ?";
-                        addSqlAttribute(span, sql);
-                        try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                            statement.setString(1, job);
-                            span.setAttribute("job", job);
-                            statement.setInt(2, build);
-                            span.setAttribute("build", build);
-                            statement.execute();
-                        }
-                        var summarySql = "DELETE FROM caseResultsSummary WHERE job = ? AND build = ?";
-                        addSqlAttribute(span, summarySql);
-                        try (PreparedStatement statement = connection.prepareStatement(summarySql)) {
-                            statement.setString(1, job);
-                            statement.setInt(2, build);
-                            statement.execute();
+                        // Perform both deletes in a single transaction so that, with autocommit
+                        // disabled, a failure in either delete rolls back the other instead of
+                        // leaving a permanent orphan caseResultsSummary row (which would otherwise
+                        // keep a deleted run visible in trend/history/count queries).
+                        boolean originalAutoCommit = connection.getAutoCommit();
+                        connection.setAutoCommit(false);
+                        try {
+                            var sql = "DELETE FROM caseResults WHERE job = ? AND build = ?";
+                            addSqlAttribute(span, sql);
+                            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                                statement.setString(1, job);
+                                span.setAttribute("job", job);
+                                statement.setInt(2, build);
+                                span.setAttribute("build", build);
+                                statement.execute();
+                            }
+                            var summarySql = "DELETE FROM caseResultsSummary WHERE job = ? AND build = ?";
+                            addSqlAttribute(span, summarySql);
+                            try (PreparedStatement statement = connection.prepareStatement(summarySql)) {
+                                statement.setString(1, job);
+                                statement.setInt(2, build);
+                                statement.execute();
+                            }
+                            connection.commit();
+                        } catch (SQLException | RuntimeException e) {
+                            connection.rollback();
+                            throw e;
+                        } finally {
+                            connection.setAutoCommit(originalAutoCommit);
                         }
                         return null;
                     });
@@ -684,18 +721,29 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 invalidateJob(job);
                 try {
                     return query(connection -> {
-                        var sql = "DELETE FROM caseResults WHERE job = ?";
-                        addSqlAttribute(span, sql);
-                        try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                            statement.setString(1, job);
-                            span.setAttribute("job", job);
-                            statement.execute();
-                        }
-                        var summarySql = "DELETE FROM caseResultsSummary WHERE job = ?";
-                        addSqlAttribute(span, summarySql);
-                        try (PreparedStatement statement = connection.prepareStatement(summarySql)) {
-                            statement.setString(1, job);
-                            statement.execute();
+                        // See deleteRun(): same atomicity rationale applies to the job-wide deletes.
+                        boolean originalAutoCommit = connection.getAutoCommit();
+                        connection.setAutoCommit(false);
+                        try {
+                            var sql = "DELETE FROM caseResults WHERE job = ?";
+                            addSqlAttribute(span, sql);
+                            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                                statement.setString(1, job);
+                                span.setAttribute("job", job);
+                                statement.execute();
+                            }
+                            var summarySql = "DELETE FROM caseResultsSummary WHERE job = ?";
+                            addSqlAttribute(span, summarySql);
+                            try (PreparedStatement statement = connection.prepareStatement(summarySql)) {
+                                statement.setString(1, job);
+                                statement.execute();
+                            }
+                            connection.commit();
+                        } catch (SQLException | RuntimeException e) {
+                            connection.rollback();
+                            throw e;
+                        } finally {
+                            connection.setAutoCommit(originalAutoCommit);
                         }
                         return null;
                     });
@@ -1285,11 +1333,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     resultsCache.put(key, this);
                     return rows;
                 });
-                if (partialCasesBySuiteName.size() < MAX_PARTIAL_SUITES_BEFORE_FULL_LOAD) {
-                    return loaded;
-                }
-                // Threshold just reached: fall through to a full load so any further distinct suites
-                // requested for this build (narrowly or otherwise) are served from the single full load.
+                // Return the just-loaded (or already-partial) result even if this call was the one that
+                // reached MAX_PARTIAL_SUITES_BEFORE_FULL_LOAD: the threshold governs how many *further*
+                // distinct suites trigger a full-build fallback (handled by the outer condition on the
+                // next call), not whether the suite that reached it gets served narrowly. Falling through
+                // to a full load here as well would run both the narrow query and the full query for the
+                // same request, contrary to the documented "above 25" threshold.
+                return loaded;
             }
             return getCasesBySuiteName(span).getOrDefault(suiteName, Collections.emptyList());
         }

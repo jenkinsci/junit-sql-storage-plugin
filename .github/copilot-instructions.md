@@ -55,14 +55,24 @@ when configuring the plugin from inside the Jenkins container). Query results di
   changes go in a new timestamped `V<yyyy_MM_dd_HHmm>__description.sql` file in both migration dirs as
   needed — existing migration files must never be edited once released.
 - **`TestResultCleanupListener`** hooks `RunListener`/`ItemListener` to delete rows from `caseResults`
-  when a build or job is deleted (unless `skipCleanupRunsOnDeletion` is set), and a separate
-  `RunListener.onFinalized` invalidates the results cache as a safety net in case the agent-side
-  publisher's own invalidation was missed (e.g. an agent that crashed mid-publish).
+  (and the matching `caseResultsSummary` rows — see below) when a build or job is deleted (unless
+  `skipCleanupRunsOnDeletion` is set), and a separate `RunListener.onFinalized` invalidates the results
+  cache as a safety net in case the agent-side publisher's own invalidation was missed (e.g. an agent
+  that crashed mid-publish).
 - The `caseResults` table (see `V2020_09_21_2052__initial-schema.sql` and later migrations for the
-  evolved schema/length limits) is the single denormalized table backing everything; row-length caps
+  evolved schema/length limits) is the primary denormalized table backing everything; row-length caps
   (`MAX_SUITE_LENGTH`, `MAX_TEST_NAME_LENGTH`, `MAX_STDOUT_LENGTH`, etc.) are enforced in
   `DatabaseTestResultStorage` before insert and must stay in sync with the column widths in the SQL
   migrations.
+- **`caseResultsSummary`** (see `V2026_10_05_2240__case-results-summary.sql`) is a second backing table:
+  one persisted row per `(job, build)` with `passCount`/`failCount`/`skipCount`/`duration`, maintained
+  incrementally at publish time (`RemotePublisherImpl#upsertSummary`) and atomically deleted alongside
+  `caseResults` on run/job deletion. Trend, duration, history, and count reads are served from this
+  table instead of aggregating every row in `caseResults` for the job. Its `passCount`/`failCount`/
+  `skipCount` predicates (errorDetails/skipped checked independently, matching the one-time backfill in
+  the migration above) must stay consistent with any changes to `caseResults`' schema or semantics —
+  it is not merely a cache, since there is no fallback path that recomputes it from `caseResults` on
+  every read.
 
 ## Conventions
 
