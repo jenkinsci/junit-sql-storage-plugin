@@ -226,8 +226,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             log.config("createRemotePublisher() -> calling getConnectionSupplier().connection() for build "
                     + build.getParent().getFullName() + " #" + build.getNumber());
             // Borrowed purely to make sure a local server is started and the table/schema exists
-            // before publishing begins; must be closed and returned to the pool immediately since
-            // ConnectionSupplier.connection() no longer keeps a connection cached for reuse.
+            // before publishing begins; each call to connection() returns a fresh pooled connection,
+            // so it must be closed and returned to the pool immediately.
             try (Connection ignored = getConnectionSupplier().connection()) {
                 // no-op; opening the connection above triggers ConnectionSupplier.initialize()
             }
@@ -507,17 +507,15 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         /**
          * Returns a fresh connection borrowed from {@link Database#getDataSource()}'s pool.
          *
-         * <p>Earlier versions of this class cached a single {@link Connection} for the lifetime of
-         * the supplier and handed that same instance out to every caller. That made every concurrent
-         * controller-side read (every job/build/test-report page view, history/trend query, etc.
-         * across the whole Jenkins instance) share one physical JDBC connection: since a
-         * {@link Connection} cannot safely be used by more than one thread at a time, this silently
-         * serialized all read traffic onto a single connection regardless of how many connections the
-         * underlying pool actually has available&mdash;a cheap, unrelated query could queue for
-         * seconds behind an expensive one just because both happened to go through the same cached
-         * connection. Returning a new (pooled, so normally already-established) connection per call
-         * instead lets independent callers run truly concurrently, up to the pool's configured size.
-         * Callers are expected to close what they get, typically via try-with-resources.
+         * <p>Each call borrows a new (pooled, so normally already-established) connection rather than
+         * sharing one cached instance: since a {@link Connection} cannot safely be used by more than
+         * one thread at a time, a single shared connection would serialize all read traffic onto it
+         * regardless of how many connections the underlying pool actually has available&mdash;a cheap,
+         * unrelated query could queue for seconds behind an expensive one just because both happened to
+         * go through the same connection. Returning a fresh connection per call instead lets
+         * independent callers (every concurrent job/build/test-report page view, history/trend query,
+         * etc.) run truly concurrently, up to the pool's configured size. Callers are expected to close
+         * what they get, typically via try-with-resources.
          */
         Connection connection() throws SQLException {
             Connection _connection = database().getDataSource().getConnection();
@@ -539,8 +537,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         @Override
         public void close() {
-            // No-op: connection() no longer caches a connection to close; each caller is responsible
-            // for closing (returning to the pool) whatever it borrowed from connection().
+            // No-op: each caller is responsible for closing (returning to the pool) whatever
+            // connection it borrowed from connection().
         }
     }
 
@@ -578,13 +576,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          * <p>{@link Database#getDataSource} lazily creates and caches a brand-new connection pool (up
          * to 8 JDBC connections by default) in a {@code transient} field the first time it is called
          * on a given {@link Database} <em>instance</em>. Since this object arrives on the agent via
-         * Java serialization (see {@link SerializableOnlyOverRemoting}), every single remote publish
-         * previously produced a fresh {@link Database} instance with no transient state &mdash; so every
-         * build that published results spun up and permanently leaked a whole new connection pool
-         * (nothing ever calls the underlying {@code BasicDataSource.close()}; {@link Database} exposes
-         * no close hook at all). Verified empirically: N sequential, non-overlapping builds against a
-         * real agent leave N more idle Postgres backends after the fact, forever. Over the lifetime of
-         * a busy controller this eventually exhausts the database's {@code max_connections}.
+         * Java serialization (see {@link SerializableOnlyOverRemoting}), every remote publish produces
+         * a freshly deserialized {@link Database} instance with no transient state: calling
+         * {@code getDataSource()} on it directly would spin up a brand-new connection pool per publish,
+         * which is never closed (nothing ever calls the underlying {@code BasicDataSource.close()};
+         * {@link Database} exposes no close hook at all), permanently leaking one pool per build. Over
+         * the lifetime of a busy controller this would eventually exhaust the database's
+         * {@code max_connections}.
          *
          * <p>Routing through {@link RemoteDatabaseCache} instead reuses the same {@link Database}
          * (and therefore the same bounded connection pool) for every publish from a given agent JVM
@@ -651,7 +649,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             // Each call borrows its own connection from the pool and returns it when done, so
             // concurrent reads (e.g. several test-report pages rendering at once) run on genuinely
             // separate connections instead of queueing behind one another; see the Javadoc on
-            // ConnectionSupplier.connection() for why this used to not be the case.
+            // ConnectionSupplier.connection() for the rationale.
             try (Connection connection = getConnectionSupplier().connection()) {
                 return querier.run(connection);
             } catch (SQLException x) {
