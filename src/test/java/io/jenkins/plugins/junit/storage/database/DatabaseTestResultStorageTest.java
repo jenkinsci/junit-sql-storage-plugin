@@ -71,6 +71,7 @@ import static org.hamcrest.core.Is.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
 @WithJenkins
@@ -686,6 +687,16 @@ class DatabaseTestResultStorageTest {
         assertSame(first, second);
         assertEquals(3, second.getCases().size());
         Mockito.verify(suiteStatement, Mockito.times(1)).executeQuery();
+
+        // And: publishing to the build invalidates its entry, so the memoized suite is dropped and the
+        // next lookup rebuilds it from the database (a running build gets new results).
+        var reloadedResultSet = mockResultSet(suiteResults);
+        Mockito.when(suiteStatement.executeQuery()).thenReturn(reloadedResultSet);
+        DatabaseTestResultStorage.invalidate("jobName-getSuiteOnce", 1);
+        SuiteResult afterInvalidate = testResultStorage.getSuite(suiteName);
+        assertNotSame(first, afterInvalidate);
+        assertEquals(3, afterInvalidate.getCases().size());
+        Mockito.verify(suiteStatement, Mockito.times(2)).executeQuery();
     }
 
     private void printCaseResultsTable() throws Exception {

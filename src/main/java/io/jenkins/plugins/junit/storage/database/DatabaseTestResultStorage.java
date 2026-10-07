@@ -1004,7 +1004,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         public SuiteResult getSuite(String suiteName) {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getSuite", span -> {
                 span.setAttribute("suite", suiteName);
-                log.fine(String.format("Getting suite result for suite %s from case results.", suiteName));
+                log.fine(() -> String.format("Getting suite result for suite %s from case results.", suiteName));
                 // Memoized per build: CaseResult#getPreviousResult() looks up the previous build's suite
                 // once per case of the current build (e.g. TestResult#getFixedCount()/#getRegressionCount()
                 // on the build's test report page walk every case). Rebuilding the suite on every call made
