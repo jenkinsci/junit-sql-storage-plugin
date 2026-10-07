@@ -1,14 +1,10 @@
 package io.jenkins.plugins.junit.storage.database;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Savepoint;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -481,75 +477,49 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          * {@code caseResults} rather than silently out of sync. A build can also be published more
          * than once (e.g. multiple {@code junit} steps, or parallel stages each publishing a subset of
          * results), so this adds to any existing row rather than replacing it.
-         * <p>Uses a portable update-then-insert pattern (rather than {@code ON CONFLICT}/
-         * {@code ON DUPLICATE KEY UPDATE}, which differ between PostgreSQL and MySQL) so the same SQL
-         * works for both supported databases; on a lost race with a concurrent publish for the same
-         * (job, build) inserting first, retries as an update.
+         * <p>Uses a single atomic dialect-specific upsert statement ({@code ON CONFLICT ... DO UPDATE}
+         * on PostgreSQL, {@code ON DUPLICATE KEY UPDATE} on MySQL) rather than a portable
+         * update-then-insert-then-retry pattern. That pattern has a real deadlock hazard under MySQL's
+         * default REPEATABLE READ isolation: an UPDATE matching no row takes a gap lock on the
+         * (job, build) key range, so two concurrent first publishes for the same brand-new build can
+         * each acquire that lock and then deadlock on their following INSERT. The deadlock victim gets
+         * SQLState 40001, which is not an integrity-constraint violation (class "23"), so it was not
+         * recoverable by retrying as an update and instead had to propagate out, rolling back the
+         * whole chunk's transaction (including the caseResults rows already batched in it). A single
+         * atomic upsert statement has no separate insert-after-failed-update window, so this deadlock
+         * shape cannot occur for either supported database.
          */
         private void upsertSummary(Connection connection, Span span, int passCount, int failCount, int skipCount,
                 double duration) throws SQLException {
             if (passCount == 0 && failCount == 0 && skipCount == 0) {
                 return;
             }
-            var updateSql = "UPDATE caseResultsSummary SET passCount = passCount + ?, failCount = failCount + ?, "
-                    + "skipCount = skipCount + ?, duration = duration + ? WHERE job = ? AND build = ?";
-            addSqlAttribute(span, updateSql);
-            try (PreparedStatement update = connection.prepareStatement(updateSql)) {
-                if (executeSummaryUpdate(update, passCount, failCount, skipCount, duration) > 0) {
-                    return;
-                }
+            boolean postgres = isPostgres(connection);
+            var upsertSql = postgres
+                    ? "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
+                            + "VALUES (?, ?, ?, ?, ?, ?) "
+                            + "ON CONFLICT (job, build) DO UPDATE SET "
+                            + "passCount = caseResultsSummary.passCount + EXCLUDED.passCount, "
+                            + "failCount = caseResultsSummary.failCount + EXCLUDED.failCount, "
+                            + "skipCount = caseResultsSummary.skipCount + EXCLUDED.skipCount, "
+                            + "duration = caseResultsSummary.duration + EXCLUDED.duration"
+                    : "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
+                            + "VALUES (?, ?, ?, ?, ?, ?) "
+                            + "ON DUPLICATE KEY UPDATE "
+                            + "passCount = passCount + VALUES(passCount), "
+                            + "failCount = failCount + VALUES(failCount), "
+                            + "skipCount = skipCount + VALUES(skipCount), "
+                            + "duration = duration + VALUES(duration)";
+            addSqlAttribute(span, upsertSql);
+            try (PreparedStatement upsert = connection.prepareStatement(upsertSql)) {
+                upsert.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
+                upsert.setInt(2, build);
+                upsert.setInt(3, passCount);
+                upsert.setInt(4, failCount);
+                upsert.setInt(5, skipCount);
+                upsert.setDouble(6, duration);
+                upsert.executeUpdate();
             }
-            var insertSql = "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
-                    + "VALUES (?, ?, ?, ?, ?, ?)";
-            // A savepoint before the insert attempt lets us recover from a duplicate-key race on
-            // PostgreSQL without losing the rest of this chunk's transaction: once a statement fails
-            // with a constraint violation, PostgreSQL aborts the *entire* transaction until a rollback
-            // (full or to a savepoint) runs, so without this, retrying the UPDATE below would itself
-            // fail with "current transaction is aborted" (SQLState 25P02) and the whole chunk
-            // (including the caseResults rows already inserted earlier in this same transaction) would
-            // be rolled back by the caller. MySQL does not abort the transaction on a single statement
-            // failure the same way, but it supports savepoints too, so the same code path is safe and
-            // portable for both databases.
-            Savepoint savepoint = connection.setSavepoint();
-            try (PreparedStatement insert = connection.prepareStatement(insertSql)) {
-                insert.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
-                insert.setInt(2, build);
-                insert.setInt(3, passCount);
-                insert.setInt(4, failCount);
-                insert.setInt(5, skipCount);
-                insert.setDouble(6, duration);
-                insert.executeUpdate();
-            } catch (SQLException x) {
-                // Only treat a genuine integrity-constraint violation (SQLState class "23", e.g. a
-                // duplicate-key/unique-violation on the (job, build) primary key) as a lost race with a
-                // concurrent publish for the same (job, build) that inserted its row first; anything
-                // else (connectivity loss, a disallowed value, etc.) is a real failure and must not be
-                // silently swallowed by retrying as an update that would otherwise appear to succeed.
-                String sqlState = x.getSQLState();
-                if (sqlState == null || !sqlState.startsWith("23")) {
-                    throw x;
-                }
-                // Undo just the failed insert attempt (and, on PostgreSQL, clear the aborted-transaction
-                // state), leaving everything committed earlier in this transaction -- in particular the
-                // caseResults rows from this same chunk -- intact and still pending commit.
-                connection.rollback(savepoint);
-                try (PreparedStatement update = connection.prepareStatement(updateSql)) {
-                    if (executeSummaryUpdate(update, passCount, failCount, skipCount, duration) == 0) {
-                        throw x;
-                    }
-                }
-            }
-        }
-
-        private int executeSummaryUpdate(PreparedStatement update, int passCount, int failCount, int skipCount,
-                double duration) throws SQLException {
-            update.setInt(1, passCount);
-            update.setInt(2, failCount);
-            update.setInt(3, skipCount);
-            update.setDouble(4, duration);
-            update.setString(5, StringUtils.truncate(job, MAX_JOB_LENGTH));
-            update.setInt(6, build);
-            return update.executeUpdate();
         }
     }
 
@@ -982,7 +952,16 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 // residual checks, so a hash collision between two different tests cannot produce an
                 // incorrect match.
                 boolean postgres = isPostgres(connection);
-                String identityHashPredicate = postgres ? "AND testidentityhash = ? " : "";
+                // Computed via Postgres's own md5(...) expression over bound parameters, with the
+                // exact same expression the testidentityhash generated column uses (see
+                // V2026_10_07_0733__failed-since-index.sql), rather than hashing client-side in Java.
+                // Postgres's md5(text) hashes bytes in the database's server_encoding, not
+                // necessarily UTF-8 (e.g. a LATIN1 database), so a client-side MD5 computed over UTF-8
+                // bytes would not reliably match the generated column's value on such databases;
+                // computing both sides with the same SQL expression avoids any encoding assumption.
+                String identityHashPredicate = postgres
+                        ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
+                        : "";
                 String sqlPassingBuild = "SELECT build " +
                         "FROM caseResults " +
                         "WHERE job = ? " +
@@ -1046,7 +1025,9 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             preparedStatement.setString(5, caseResult.getClassName());
             preparedStatement.setString(6, caseResult.getName());
             if (postgres) {
-                preparedStatement.setString(7, testIdentityHash(job, caseResult.getClassName(), caseResult.getName()));
+                preparedStatement.setString(7, job);
+                preparedStatement.setString(8, caseResult.getClassName());
+                preparedStatement.setString(9, caseResult.getName());
             }
         }
 
@@ -1661,32 +1642,5 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      */
     private static boolean isPostgres(Connection connection) throws SQLException {
         return "PostgreSQL".equals(connection.getMetaData().getDatabaseProductName());
-    }
-
-    /**
-     * Computes the same bounded-size identity hash as the {@code testidentityhash} stored
-     * generated column added by {@code V2026_10_07_0733__failed-since-index.sql} (PostgreSQL only),
-     * so queries can filter on it with a bind parameter rather than relying on the database to
-     * re-derive it. Null classname/testname are treated as empty strings, matching the column's
-     * {@code coalesce(..., '')} definition; a single {@code 0x01} byte separates each part so that,
-     * for example, {@code job="a", classname="bc"} cannot collide with {@code job="ab", classname="c"}.
-     */
-    private static String testIdentityHash(String job, String className, String testName) {
-        try {
-            MessageDigest md5 = MessageDigest.getInstance("MD5");
-            md5.update(Util.fixNull(job).getBytes(StandardCharsets.UTF_8));
-            md5.update((byte) 1);
-            md5.update(Util.fixNull(className).getBytes(StandardCharsets.UTF_8));
-            md5.update((byte) 1);
-            md5.update(Util.fixNull(testName).getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(32);
-            for (byte b : md5.digest()) {
-                hex.append(String.format("%02x", b));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException x) {
-            // MD5 is a standard JVM algorithm guaranteed to be available (JLS/JCA baseline).
-            throw new IllegalStateException(x);
-        }
     }
 }

@@ -170,17 +170,26 @@ if [[ "$MODE" == "finalize" ]]; then
     # a duplicate and skipped. A small number of false negatives (genuinely new, byte-identical
     # duplicate rows within the same second) are possible in theory; the row-count validation below
     # is the authoritative safety net, not this filter.
+    # All text-column comparisons are forced to BINARY so they compare raw bytes rather than the
+    # columns' (collation-dependent, often case-insensitive) default comparison. Without this, a
+    # late-arriving row whose text content only changed case (e.g. an error message changing from
+    # "Error A" to "error a") could be wrongly treated as byte-identical to an already-copied row
+    # and silently skipped as a duplicate; the row-count check afterwards would not catch this
+    # since it only compares totals, not content.
     run_sql "INSERT INTO caseResults_new (job, build, suite, package, className, testName, stdout, stderr, stacktrace, errorDetails, skipped, duration, timestamp)
              SELECT t.job, t.build, t.suite, t.package, t.className, t.testName, t.stdout, t.stderr, t.stacktrace, t.errorDetails, t.skipped, t.duration, t.timestamp
              FROM caseResults t
              WHERE t.timestamp >= (SELECT started_at FROM caseResultsMigrationWatermark LIMIT 1)
                AND NOT EXISTS (
                    SELECT 1 FROM caseResults_new n
-                   WHERE n.job = t.job AND n.build = t.build AND n.suite <=> t.suite
-                     AND n.package <=> t.package AND n.className <=> t.className AND n.testName <=> t.testName
+                   WHERE BINARY n.job = BINARY t.job AND n.build = t.build
+                     AND BINARY n.suite <=> BINARY t.suite
+                     AND BINARY n.package <=> BINARY t.package AND BINARY n.className <=> BINARY t.className
+                     AND BINARY n.testName <=> BINARY t.testName
                      AND n.timestamp = t.timestamp AND n.duration <=> t.duration
-                     AND n.stdout <=> t.stdout AND n.stderr <=> t.stderr AND n.stacktrace <=> t.stacktrace
-                     AND n.errorDetails <=> t.errorDetails AND n.skipped <=> t.skipped
+                     AND BINARY n.stdout <=> BINARY t.stdout AND BINARY n.stderr <=> BINARY t.stderr
+                     AND BINARY n.stacktrace <=> BINARY t.stacktrace
+                     AND BINARY n.errorDetails <=> BINARY t.errorDetails AND BINARY n.skipped <=> BINARY t.skipped
                );"
 
     old_count=$(run_sql "SELECT COUNT(*) FROM caseResults;")
