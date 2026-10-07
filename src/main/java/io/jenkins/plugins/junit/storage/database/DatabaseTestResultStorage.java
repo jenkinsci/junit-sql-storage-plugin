@@ -326,114 +326,144 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     PreparedStatement statement = connection.prepareStatement(sql);
                     Scope ignore = publishSpan.makeCurrent()) {
                 addSqlAttribute(publishSpan, sql);
-                int count = 0;
-                // Aggregate counts/duration for whichever batch chunk is currently unflushed, so that
-                // caseResultsSummary (see #upsertSummary) can be updated with exactly the rows that
-                // were actually just committed to caseResults in each flush below, including on a
-                // partial-batch failure partway through a large publish.
-                int chunkPassCount = 0;
-                int chunkFailCount = 0;
-                int chunkSkipCount = 0;
-                double chunkDuration = 0;
-                for (SuiteResult suiteResult : result.getSuites()) {
-                    for (CaseResult caseResult : suiteResult.getCases()) {
-                        statement.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
-                        statement.setInt(2, build);
-                        statement.setString(3, StringUtils.truncate(suiteResult.getName(), MAX_SUITE_LENGTH));
-                        statement.setString(4, StringUtils.truncate(caseResult.getPackageName(), MAX_PACKAGE_LENGTH));
-                        statement.setString(5, StringUtils.truncate(caseResult.getClassName(), MAX_CLASSNAME_LENGTH));
-                        statement.setString(6, StringUtils.truncate(caseResult.getName(), MAX_TEST_NAME_LENGTH));
-                        String errorDetails = caseResult.getErrorDetails();
-                        if (errorDetails != null) {
-                            errorDetails = StringUtils.truncate(errorDetails, MAX_ERROR_DETAILS_LENGTH);
-                            statement.setString(7, errorDetails);
-                        } else {
-                            statement.setNull(7, Types.VARCHAR);
-                        }
-                        if (caseResult.isSkipped()) {
-                            statement.setString(8, StringUtils.truncate(Util.fixNull(caseResult.getSkippedMessage()),
-                                    MAX_SKIPPED_LENGTH));
-                        } else {
-                            statement.setNull(8, Types.VARCHAR);
-                        }
-                        statement.setFloat(9, caseResult.getDuration());
-                        // Match the independent errorDetails IS NOT NULL / skipped IS NOT NULL predicates used
-                        // by the migration backfill (see V2026_10_05_2240__case-results-summary.sql) and the
-                        // original per-row aggregate queries, rather than treating them as mutually exclusive,
-                        // so summaries are identical regardless of whether a build was backfilled or published
-                        // after this upgrade.
-                        boolean isSkipped = caseResult.isSkipped();
-                        if (errorDetails != null) {
-                            chunkFailCount++;
-                        }
-                        if (isSkipped) {
-                            chunkSkipCount++;
-                        }
-                        if (errorDetails == null && !isSkipped) {
-                            chunkPassCount++;
-                        }
-                        chunkDuration += caseResult.getDuration();
-                        if (StringUtils.isNotEmpty(caseResult.getStdout())) {
-                            statement.setString(10, StringUtils.truncate(caseResult.getStdout(), MAX_STDOUT_LENGTH));
-                        } else {
-                            statement.setNull(10, Types.VARCHAR);
-                        }
-                        if (StringUtils.isNotEmpty(caseResult.getStderr())) {
-                            statement.setString(11, StringUtils.truncate(caseResult.getStderr(), MAX_STDERR_LENGTH));
-                        } else {
-                            statement.setNull(11, Types.VARCHAR);
-                        }
-                        if (StringUtils.isNotEmpty(caseResult.getErrorStackTrace())) {
-                            statement.setString(12,
-                                    StringUtils.truncate(caseResult.getErrorStackTrace(), MAX_STACK_TRACE_LENGTH));
-                        } else {
-                            statement.setNull(12, Types.VARCHAR);
-                        }
-                        statement.addBatch();
-                        count++;
-                        if (count % MAX_DB_BATCH_SIZE == 0) {
-                            log.config(String.format("Inserting %d test cases for '%s #%d'.", MAX_DB_BATCH_SIZE, job, build));
-                            var batchSpan = getTracer()
-                                    .spanBuilder("sql batch insert caseResults")
-                                    .startSpan();
-                            try(Scope _ignore = batchSpan.makeCurrent()) {
-                                statement.executeBatch();
-                                batchSpan.setAttribute("batchSize", MAX_DB_BATCH_SIZE);
-                                statement.clearBatch();
-                            } finally {
-                                batchSpan.end();
-                            }
-                            upsertSummary(connection, publishSpan, chunkPassCount, chunkFailCount, chunkSkipCount,
-                                    chunkDuration);
-                            chunkPassCount = 0;
-                            chunkFailCount = 0;
-                            chunkSkipCount = 0;
-                            chunkDuration = 0;
-                        }
+                // Flush each chunk (the caseResults batch insert plus its caseResultsSummary delta) in
+                // a single transaction, mirroring deleteRun()/deleteJob(): without this, a crash or
+                // error between executeBatch() and upsertSummary() (or a mid-transaction failure in
+                // upsertSummary() itself) could leave caseResultsSummary permanently inconsistent with
+                // what was actually committed to caseResults, since they were previously two independent
+                // auto-committed statements with no rollback tying them together.
+                boolean originalAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(false);
+                try {
+                    doPublishWithinTransaction(connection, statement, publishSpan, result);
+                } catch (SQLException | RuntimeException x) {
+                    try {
+                        connection.rollback();
+                    } catch (SQLException ignored) {
+                        // Best-effort: the original exception below is what actually gets reported; a
+                        // failure to roll back (e.g. connection already broken) shouldn't mask it.
                     }
-                }
-                if (count % MAX_DB_BATCH_SIZE != 0) {
-                    var batchSpan = getTracer()
-                            .spanBuilder("sql batch insert caseResults")
-                            .startSpan();
-                    try(Scope _ignore = batchSpan.makeCurrent()) {
-                        int[] updateCounts = statement.executeBatch();
-                        int numberOfItemsStored = updateCounts.length;
-                        log.config(String.format("Inserted final %d test cases for '%s #%d'.",
-                                numberOfItemsStored, job, build));
-                        batchSpan.setAttribute("batchSize", numberOfItemsStored);
-                    } finally {
-                        batchSpan.end();
+                    if (x instanceof SQLException) {
+                        throw new IOException(x);
                     }
-                    upsertSummary(connection, publishSpan, chunkPassCount, chunkFailCount, chunkSkipCount,
-                            chunkDuration);
+                    throw (RuntimeException) x;
+                } finally {
+                    connection.setAutoCommit(originalAutoCommit);
                 }
-                log.info(String.format("Saved %d test cases into database for '%s #%d'.", count, job, build));
             } catch (SQLException x) {
                 throw new IOException(x);
             } finally {
                 publishSpan.end();
             }
+        }
+
+        private void doPublishWithinTransaction(Connection connection, PreparedStatement statement, Span publishSpan,
+                TestResult result) throws SQLException {
+            int count = 0;
+            // Aggregate counts/duration for whichever batch chunk is currently unflushed, so that
+            // caseResultsSummary (see #upsertSummary) can be updated with exactly the rows that
+            // were actually just committed to caseResults in each flush below, including on a
+            // partial-batch failure partway through a large publish.
+            int chunkPassCount = 0;
+            int chunkFailCount = 0;
+            int chunkSkipCount = 0;
+            double chunkDuration = 0;
+            for (SuiteResult suiteResult : result.getSuites()) {
+                for (CaseResult caseResult : suiteResult.getCases()) {
+                    statement.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
+                    statement.setInt(2, build);
+                    statement.setString(3, StringUtils.truncate(suiteResult.getName(), MAX_SUITE_LENGTH));
+                    statement.setString(4, StringUtils.truncate(caseResult.getPackageName(), MAX_PACKAGE_LENGTH));
+                    statement.setString(5, StringUtils.truncate(caseResult.getClassName(), MAX_CLASSNAME_LENGTH));
+                    statement.setString(6, StringUtils.truncate(caseResult.getName(), MAX_TEST_NAME_LENGTH));
+                    String errorDetails = caseResult.getErrorDetails();
+                    if (errorDetails != null) {
+                        errorDetails = StringUtils.truncate(errorDetails, MAX_ERROR_DETAILS_LENGTH);
+                        statement.setString(7, errorDetails);
+                    } else {
+                        statement.setNull(7, Types.VARCHAR);
+                    }
+                    if (caseResult.isSkipped()) {
+                        statement.setString(8, StringUtils.truncate(Util.fixNull(caseResult.getSkippedMessage()),
+                                MAX_SKIPPED_LENGTH));
+                    } else {
+                        statement.setNull(8, Types.VARCHAR);
+                    }
+                    statement.setFloat(9, caseResult.getDuration());
+                    // Match the independent errorDetails IS NOT NULL / skipped IS NOT NULL predicates used
+                    // by the migration backfill (see V2026_10_05_2240__case-results-summary.sql) and the
+                    // original per-row aggregate queries, rather than treating them as mutually exclusive,
+                    // so summaries are identical regardless of whether a build was backfilled or published
+                    // after this upgrade.
+                    boolean isSkipped = caseResult.isSkipped();
+                    if (errorDetails != null) {
+                        chunkFailCount++;
+                    }
+                    if (isSkipped) {
+                        chunkSkipCount++;
+                    }
+                    if (errorDetails == null && !isSkipped) {
+                        chunkPassCount++;
+                    }
+                    chunkDuration += caseResult.getDuration();
+                    if (StringUtils.isNotEmpty(caseResult.getStdout())) {
+                        statement.setString(10, StringUtils.truncate(caseResult.getStdout(), MAX_STDOUT_LENGTH));
+                    } else {
+                        statement.setNull(10, Types.VARCHAR);
+                    }
+                    if (StringUtils.isNotEmpty(caseResult.getStderr())) {
+                        statement.setString(11, StringUtils.truncate(caseResult.getStderr(), MAX_STDERR_LENGTH));
+                    } else {
+                        statement.setNull(11, Types.VARCHAR);
+                    }
+                    if (StringUtils.isNotEmpty(caseResult.getErrorStackTrace())) {
+                        statement.setString(12,
+                                StringUtils.truncate(caseResult.getErrorStackTrace(), MAX_STACK_TRACE_LENGTH));
+                    } else {
+                        statement.setNull(12, Types.VARCHAR);
+                    }
+                    statement.addBatch();
+                    count++;
+                    if (count % MAX_DB_BATCH_SIZE == 0) {
+                        log.config(String.format("Inserting %d test cases for '%s #%d'.", MAX_DB_BATCH_SIZE, job, build));
+                        var batchSpan = getTracer()
+                                .spanBuilder("sql batch insert caseResults")
+                                .startSpan();
+                        try(Scope _ignore = batchSpan.makeCurrent()) {
+                            statement.executeBatch();
+                            batchSpan.setAttribute("batchSize", MAX_DB_BATCH_SIZE);
+                            statement.clearBatch();
+                        } finally {
+                            batchSpan.end();
+                        }
+                        upsertSummary(connection, publishSpan, chunkPassCount, chunkFailCount, chunkSkipCount,
+                                chunkDuration);
+                        connection.commit();
+                        chunkPassCount = 0;
+                        chunkFailCount = 0;
+                        chunkSkipCount = 0;
+                        chunkDuration = 0;
+                    }
+                }
+            }
+            if (count % MAX_DB_BATCH_SIZE != 0) {
+                var batchSpan = getTracer()
+                        .spanBuilder("sql batch insert caseResults")
+                        .startSpan();
+                try(Scope _ignore = batchSpan.makeCurrent()) {
+                    int[] updateCounts = statement.executeBatch();
+                    int numberOfItemsStored = updateCounts.length;
+                    log.config(String.format("Inserted final %d test cases for '%s #%d'.",
+                            numberOfItemsStored, job, build));
+                    batchSpan.setAttribute("batchSize", numberOfItemsStored);
+                } finally {
+                    batchSpan.end();
+                }
+                upsertSummary(connection, publishSpan, chunkPassCount, chunkFailCount, chunkSkipCount,
+                        chunkDuration);
+                connection.commit();
+            }
+            log.info(String.format("Saved %d test cases into database for '%s #%d'.", count, job, build));
         }
 
         /**
@@ -447,54 +477,49 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          * {@code caseResults} rather than silently out of sync. A build can also be published more
          * than once (e.g. multiple {@code junit} steps, or parallel stages each publishing a subset of
          * results), so this adds to any existing row rather than replacing it.
-         * <p>Uses a portable update-then-insert pattern (rather than {@code ON CONFLICT}/
-         * {@code ON DUPLICATE KEY UPDATE}, which differ between PostgreSQL and MySQL) so the same SQL
-         * works for both supported databases; on a lost race with a concurrent publish for the same
-         * (job, build) inserting first, retries as an update.
+         * <p>Uses a single atomic dialect-specific upsert statement ({@code ON CONFLICT ... DO UPDATE}
+         * on PostgreSQL, {@code ON DUPLICATE KEY UPDATE} on MySQL) rather than a portable
+         * update-then-insert-then-retry pattern. That pattern has a real deadlock hazard under MySQL's
+         * default REPEATABLE READ isolation: an UPDATE matching no row takes a gap lock on the
+         * (job, build) key range, so two concurrent first publishes for the same brand-new build can
+         * each acquire that lock and then deadlock on their following INSERT. The deadlock victim gets
+         * SQLState 40001, which is not an integrity-constraint violation (class "23"), so it was not
+         * recoverable by retrying as an update and instead had to propagate out, rolling back the
+         * whole chunk's transaction (including the caseResults rows already batched in it). A single
+         * atomic upsert statement has no separate insert-after-failed-update window, so this deadlock
+         * shape cannot occur for either supported database.
          */
         private void upsertSummary(Connection connection, Span span, int passCount, int failCount, int skipCount,
                 double duration) throws SQLException {
             if (passCount == 0 && failCount == 0 && skipCount == 0) {
                 return;
             }
-            var updateSql = "UPDATE caseResultsSummary SET passCount = passCount + ?, failCount = failCount + ?, "
-                    + "skipCount = skipCount + ?, duration = duration + ? WHERE job = ? AND build = ?";
-            addSqlAttribute(span, updateSql);
-            try (PreparedStatement update = connection.prepareStatement(updateSql)) {
-                if (executeSummaryUpdate(update, passCount, failCount, skipCount, duration) > 0) {
-                    return;
-                }
+            boolean postgres = isPostgres(connection);
+            var upsertSql = postgres
+                    ? "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
+                            + "VALUES (?, ?, ?, ?, ?, ?) "
+                            + "ON CONFLICT (job, build) DO UPDATE SET "
+                            + "passCount = caseResultsSummary.passCount + EXCLUDED.passCount, "
+                            + "failCount = caseResultsSummary.failCount + EXCLUDED.failCount, "
+                            + "skipCount = caseResultsSummary.skipCount + EXCLUDED.skipCount, "
+                            + "duration = caseResultsSummary.duration + EXCLUDED.duration"
+                    : "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
+                            + "VALUES (?, ?, ?, ?, ?, ?) "
+                            + "ON DUPLICATE KEY UPDATE "
+                            + "passCount = passCount + VALUES(passCount), "
+                            + "failCount = failCount + VALUES(failCount), "
+                            + "skipCount = skipCount + VALUES(skipCount), "
+                            + "duration = duration + VALUES(duration)";
+            addSqlAttribute(span, upsertSql);
+            try (PreparedStatement upsert = connection.prepareStatement(upsertSql)) {
+                upsert.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
+                upsert.setInt(2, build);
+                upsert.setInt(3, passCount);
+                upsert.setInt(4, failCount);
+                upsert.setInt(5, skipCount);
+                upsert.setDouble(6, duration);
+                upsert.executeUpdate();
             }
-            var insertSql = "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
-                    + "VALUES (?, ?, ?, ?, ?, ?)";
-            try (PreparedStatement insert = connection.prepareStatement(insertSql)) {
-                insert.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
-                insert.setInt(2, build);
-                insert.setInt(3, passCount);
-                insert.setInt(4, failCount);
-                insert.setInt(5, skipCount);
-                insert.setDouble(6, duration);
-                insert.executeUpdate();
-            } catch (SQLException x) {
-                // Lost a race with a concurrent publish for the same (job, build) that inserted its row
-                // first; retry as an update rather than failing the whole publish.
-                try (PreparedStatement update = connection.prepareStatement(updateSql)) {
-                    if (executeSummaryUpdate(update, passCount, failCount, skipCount, duration) == 0) {
-                        throw x;
-                    }
-                }
-            }
-        }
-
-        private int executeSummaryUpdate(PreparedStatement update, int passCount, int failCount, int skipCount,
-                double duration) throws SQLException {
-            update.setInt(1, passCount);
-            update.setInt(2, failCount);
-            update.setInt(3, skipCount);
-            update.setDouble(4, duration);
-            update.setString(5, StringUtils.truncate(job, MAX_JOB_LENGTH));
-            update.setInt(6, build);
-            return update.executeUpdate();
         }
     }
 
@@ -917,6 +942,26 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 var spanPassingBuild = createSpan("lastPassingBuild");
                 int lastPassingBuildNumber;
                 Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
+                // On PostgreSQL, failed_since_index is keyed on a bounded-size hash of
+                // (job, classname, testname) rather than those columns directly, since PostgreSQL btree
+                // indexes have a hard per-entry size limit that long/multibyte values in those columns
+                // can exceed (see V2026_10_07_0733__failed-since-index.sql in db/migration/postgres).
+                // MySQL supports indexing a length-limited column prefix instead, so its equivalent
+                // index can cover the full columns directly and does not need this. The original
+                // job/classname/testname equality filters are kept in both cases as exact-value
+                // residual checks, so a hash collision between two different tests cannot produce an
+                // incorrect match.
+                boolean postgres = isPostgres(connection);
+                // Computed via Postgres's own md5(...) expression over bound parameters, with the
+                // exact same expression the testidentityhash generated column uses (see
+                // V2026_10_07_0733__failed-since-index.sql), rather than hashing client-side in Java.
+                // Postgres's md5(text) hashes bytes in the database's server_encoding, not
+                // necessarily UTF-8 (e.g. a LATIN1 database), so a client-side MD5 computed over UTF-8
+                // bytes would not reliably match the generated column's value on such databases;
+                // computing both sides with the same SQL expression avoids any encoding assumption.
+                String identityHashPredicate = postgres
+                        ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
+                        : "";
                 String sqlPassingBuild = "SELECT build " +
                         "FROM caseResults " +
                         "WHERE job = ? " +
@@ -925,13 +970,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         "AND package = ? " +
                         "AND classname = ? " +
                         "AND testname = ? " +
+                        identityHashPredicate +
                         "AND errordetails IS NULL " +
                         "ORDER BY BUILD DESC " +
                         "LIMIT 1";
                 addSqlAttribute(spanPassingBuild, sqlPassingBuild);
                 try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
                      Scope ignore = spanPassingBuild.makeCurrent()) {
-                    addCaseResultToStatement(caseResult, build, statement);
+                    addCaseResultToStatement(caseResult, build, statement, postgres);
                     try (ResultSet result = statement.executeQuery()) {
                         boolean hasPassed = result.next();
                         if (!hasPassed) {
@@ -951,13 +997,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         "AND package = ? " +
                         "AND classname = ? " +
                         "AND testname = ? " +
+                        identityHashPredicate +
                         "AND errordetails is NOT NULL " +
                         "ORDER BY BUILD ASC " +
                         "LIMIT 1";
                 addSqlAttribute(spanFailingBuild, sqlFailedBuild);
                 try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
                      Scope ignore = spanFailingBuild.makeCurrent()) {
-                    addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
+                    addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement, postgres);
                     try (ResultSet result = statement.executeQuery()) {
                         result.next();
                         int firstFailingBuildAfterPassing = result.getInt("build");
@@ -969,14 +1016,19 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             });
         }
 
-        private void addCaseResultToStatement(CaseResult caseResult, int build, PreparedStatement preparedStatement)
-                throws SQLException {
+        private void addCaseResultToStatement(CaseResult caseResult, int build, PreparedStatement preparedStatement,
+                boolean postgres) throws SQLException {
             preparedStatement.setString(1, job);
             preparedStatement.setInt(2, build);
             preparedStatement.setString(3, caseResult.getSuiteResult().getName());
             preparedStatement.setString(4, caseResult.getPackageName());
             preparedStatement.setString(5, caseResult.getClassName());
             preparedStatement.setString(6, caseResult.getName());
+            if (postgres) {
+                preparedStatement.setString(7, job);
+                preparedStatement.setString(8, caseResult.getClassName());
+                preparedStatement.setString(9, caseResult.getName());
+            }
         }
 
         @Override
@@ -1579,5 +1631,16 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
     private static Tracer getTracer() {
         return GlobalOpenTelemetry.getTracer("io.jenkins.plugins.junit.storage.database");
+    }
+
+    /**
+     * Whether the given connection is to PostgreSQL rather than MySQL, the two databases this
+     * plugin supports. Used to select the PostgreSQL-specific {@code testidentityhash}-based
+     * variant of the "failed since" lookup query (see {@code computeFailedSinceRun}), which exists
+     * because PostgreSQL's btree index entry size limit (unlike MySQL's prefix-length indexes)
+     * cannot safely index the full job/classname/testname columns directly.
+     */
+    private static boolean isPostgres(Connection connection) throws SQLException {
+        return "PostgreSQL".equals(connection.getMetaData().getDatabaseProductName());
     }
 }

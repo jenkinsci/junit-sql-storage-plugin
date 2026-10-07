@@ -49,6 +49,11 @@
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
+            <artifactId>database-mysql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>junit</artifactId>
         </dependency>
         <dependency>
@@ -108,6 +113,43 @@
                     <artifactId>annotations</artifactId>
                 </exclusion>
             </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>mysql</artifactId>
+            <version>1.21.4</version>
+            <scope>test</scope>
+            <exclusions>
+                <!-- Unlike PostgreSQLContainer, MySQLContainer#configure() unconditionally calls
+                     optionallyMapResourceParameterAsVolume(), which requires
+                     org.apache.commons.compress.archivers.ArchiveEntry on the classpath even when
+                     no init script/config override is used, so commons-compress cannot be excluded
+                     here the way it is for the postgresql testcontainers module above. -->
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.jetbrains</groupId>
+                    <artifactId>annotations</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>9.6.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Required at runtime by MySQLContainer#configure() (see comment above); not pulled
+                 in transitively because jenkins-core's own dependency management excludes/omits
+                 it, so it must be declared explicitly here, matching the version the testcontainers
+                 mysql module itself depends on. -->
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-compress</artifactId>
+            <version>1.24.0</version>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.mockito</groupId>
