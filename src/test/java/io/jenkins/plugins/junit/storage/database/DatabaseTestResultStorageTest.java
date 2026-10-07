@@ -71,6 +71,7 @@ import static org.hamcrest.core.Is.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 @WithJenkins
 class DatabaseTestResultStorageTest {
@@ -651,6 +652,39 @@ class DatabaseTestResultStorageTest {
         // And: looking up the same suite again reuses the already-loaded partial result rather than
         // issuing a second query.
         testResultStorage.getSuite(suite1Results.get(0).getSuiteResult().getName());
+        Mockito.verify(suiteStatement, Mockito.times(1)).executeQuery();
+    }
+
+    @Test
+    void getSuite_buildsEachSuiteOnce_mockDatabase() throws SQLException {
+        // Given: a build whose suite is looked up once per case of the next build, as
+        // CaseResult#getPreviousResult() does for every case when the test report page counts
+        // fixed/regressed tests. Rebuilding the suite on every lookup made the page cost
+        // (cases x suite size) and hang on large builds.
+        var databaseTestResultStorage = new DatabaseTestResultStorage();
+        databaseTestResultStorage.connectionSupplier = Mockito.mock(DatabaseTestResultStorage.ConnectionSupplier.class);
+        var connection = Mockito.mock(Connection.class);
+        Mockito.when(databaseTestResultStorage.connectionSupplier.connection()).thenReturn(connection);
+
+        var suiteStatement = Mockito.mock(PreparedStatement.class);
+        Mockito.when(connection.prepareStatement(
+                Mockito.argThat(sql -> sql != null && sql.contains("SELECT suite, package") && sql.contains("AND suite = ?"))))
+                .thenReturn(suiteStatement);
+        List<CaseResult> suiteResults = getCaseResults("package1", "class11", 3, 0, 0);
+        var suiteResultSet = mockResultSet(suiteResults);
+        Mockito.when(suiteStatement.executeQuery()).thenReturn(suiteResultSet);
+
+        var testResultStorage =
+                (DatabaseTestResultStorage.TestResultStorage) databaseTestResultStorage.load("jobName-getSuiteOnce", 1);
+        String suiteName = suiteResults.get(0).getSuiteResult().getName();
+
+        // When
+        SuiteResult first = testResultStorage.getSuite(suiteName);
+        SuiteResult second = testResultStorage.getSuite(suiteName);
+
+        // Then: the same suite instance is returned, with its cases added once.
+        assertSame(first, second);
+        assertEquals(3, second.getCases().size());
         Mockito.verify(suiteStatement, Mockito.times(1)).executeQuery();
     }
 
