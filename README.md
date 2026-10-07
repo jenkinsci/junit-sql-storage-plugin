@@ -140,6 +140,36 @@ acktrace |         timestamp
 If working with a larger number of test results you will want to increase the memory from the default.
 If you're using the dev server, e.g. `-Dmaven.hpi.run.jvmArgs=-Xms512M -Xmx3G -XX:+HeapDumpOnOutOfMemoryError`
 
+### Scaling to large test result history
+
+This plugin writes each build's test cases in batches (JDBC `addBatch`/`executeBatch`), but by default both
+the MySQL and PostgreSQL JDBC drivers still send each statement in a batch as its own round trip to the
+server unless batch rewriting is explicitly enabled on the connection. For installs with large numbers of
+test cases per build, enabling the driver's batch-rewriting option turns each flushed batch into a single
+multi-row `INSERT`, significantly reducing publish time and server-side overhead. Configure this as part of
+the JDBC URL/connection properties in the `database`/`database-mysql`/`database-postgresql` plugin's
+configuration (Manage Jenkins → Configure System → Global Database):
+
+* MySQL: append `rewriteBatchedStatements=true` to the JDBC URL.
+* PostgreSQL: append `reWriteBatchedInserts=true` to the JDBC URL (enabled by default since pgjdbc 42.x
+  in some distributions, but safe to set explicitly).
+
+If you have a job with a very large amount of test history (many thousands of builds, or very large
+per-build test case counts), be aware that:
+
+* Trend/history/duration pages read from a small persisted per-build summary table
+  (`caseResultsSummary`), not by aggregating `caseResults` on every request, so these stay fast regardless
+  of total history size.
+* "Failed since" lookups (shown next to failing tests) are served by a dedicated index on
+  `(job, classname, testname, build)`, so they stay fast even when a job's full history is tens of millions
+  of rows.
+* The underlying `caseResults` table is not physically clustered by `(job, build)` (no clustering primary
+  key), so very large, long-lived installs may still see slower table scans/vacuum-adjacent maintenance
+  than a clustered layout would give. Addressing this requires an online table-rewrite (e.g. a copy-and-swap
+  migration), which is a higher-risk, operator-triggered change rather than something this plugin applies
+  automatically; see [issue #535](https://github.com/jenkinsci/junit-sql-storage-plugin/issues/535) for
+  background and a proposed migration approach if you are affected.
+
 ## Contributing
 
 Refer to our [contribution guidelines](https://github.com/jenkinsci/.github/blob/master/CONTRIBUTING.md)
