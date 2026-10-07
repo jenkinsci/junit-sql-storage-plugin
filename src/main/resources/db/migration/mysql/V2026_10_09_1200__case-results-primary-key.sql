@@ -29,24 +29,31 @@ SET @needs_id := (SELECT COUNT(*) = 0
                    WHERE table_schema = DATABASE()
                      AND table_name = 'caseResults'
                      AND column_name = 'id');
-SET @add_id_sql := IF(@needs_id,
-                       'ALTER TABLE caseResults ADD COLUMN id BIGINT NOT NULL AUTO_INCREMENT FIRST, ADD KEY id_key (id)',
-                       'DO 0');
-PREPARE add_id_stmt FROM @add_id_sql;
-EXECUTE add_id_stmt;
-DEALLOCATE PREPARE add_id_stmt;
-
 SET @needs_pk := (SELECT COUNT(*) = 0
                    FROM information_schema.table_constraints
                    WHERE table_schema = DATABASE()
                      AND table_name = 'caseResults'
                      AND constraint_type = 'PRIMARY KEY');
-SET @add_pk_sql := IF(@needs_pk,
-                       'ALTER TABLE caseResults ADD PRIMARY KEY (job, build, id)',
-                       'DO 0');
-PREPARE add_pk_stmt FROM @add_pk_sql;
-EXECUTE add_pk_stmt;
-DEALLOCATE PREPARE add_pk_stmt;
+-- Both the id column and the primary key are usually missing together (a fresh pre-#539 install),
+-- and each is independently an "ADD PRIMARY KEY"-class ALTER that rebuilds the whole table
+-- ("Rebuilds table: Yes" for both ADD COLUMN ... AUTO_INCREMENT and ADD PRIMARY KEY). Doing them as
+-- two separate ALTER TABLE statements would rebuild an 80M+ row table twice for no benefit, roughly
+-- doubling this migration's already-long blocking window; combining them into a single ALTER TABLE
+-- performs one rebuild instead. The two are only issued separately below for the partially-applied
+-- edge case (e.g. an operator who ran only part of the standalone script, or who added one of the
+-- two by hand), where only one of the two actually needs doing.
+SET @alter_sql := CASE
+    WHEN @needs_id AND @needs_pk THEN
+        'ALTER TABLE caseResults ADD COLUMN id BIGINT NOT NULL AUTO_INCREMENT FIRST, ADD KEY id_key (id), ADD PRIMARY KEY (job, build, id)'
+    WHEN @needs_id THEN
+        'ALTER TABLE caseResults ADD COLUMN id BIGINT NOT NULL AUTO_INCREMENT FIRST, ADD KEY id_key (id)'
+    WHEN @needs_pk THEN
+        'ALTER TABLE caseResults ADD PRIMARY KEY (job, build, id)'
+    ELSE 'DO 0'
+END;
+PREPARE alter_stmt FROM @alter_sql;
+EXECUTE alter_stmt;
+DEALLOCATE PREPARE alter_stmt;
 
 SET @has_job_and_build_index := (SELECT COUNT(*) > 0
                                   FROM information_schema.statistics

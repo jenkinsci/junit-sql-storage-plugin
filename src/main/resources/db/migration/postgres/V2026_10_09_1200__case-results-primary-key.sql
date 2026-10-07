@@ -27,17 +27,17 @@
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name = 'caseresults' AND column_name = 'id') THEN
+                   WHERE table_schema = current_schema() AND table_name = 'caseresults' AND column_name = 'id') THEN
         ALTER TABLE caseresults ADD COLUMN id BIGSERIAL;
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints
-                   WHERE table_name = 'caseresults' AND constraint_type = 'PRIMARY KEY') THEN
+                   WHERE table_schema = current_schema() AND table_name = 'caseresults' AND constraint_type = 'PRIMARY KEY') THEN
         ALTER TABLE caseresults ADD PRIMARY KEY (job, build, id);
     END IF;
 
     IF EXISTS (SELECT 1 FROM pg_indexes
-               WHERE tablename = 'caseresults' AND indexname = 'job_and_build_index') THEN
+               WHERE schemaname = current_schema() AND tablename = 'caseresults' AND indexname = 'job_and_build_index') THEN
         DROP INDEX job_and_build_index;
     END IF;
 END $$;

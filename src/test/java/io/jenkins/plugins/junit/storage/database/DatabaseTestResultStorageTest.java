@@ -10,6 +10,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -58,7 +59,9 @@ import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_ERROR_DETAILS_LENGTH;
+import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_CLASSNAME_LENGTH;
 import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_SUITE_LENGTH;
+import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_TEST_NAME_LENGTH;
 import static java.util.Objects.requireNonNull;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
@@ -442,6 +445,80 @@ class DatabaseTestResultStorageTest {
     }
 
     @Test
+    void failedSince_longMultibyteTestIdentity_postgres() throws Exception {
+        // Given: a job/classname/testname combination long enough and multibyte enough (CJK
+        // characters are 3 bytes each in UTF-8) that a plain btree index over the full columns would
+        // exceed PostgreSQL's per-entry index size limit -- this is exactly the scenario
+        // V2026_10_07_0733__failed-since-index.sql's testidentityhash-based index (rather than
+        // indexing job/classname/testname directly) exists to support. Regression test for
+        // https://github.com/jenkinsci/junit-sql-storage-plugin/pull/539#pullrequestreview-5439494112.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "longMultibyteIdentity");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+
+            // No '.' in the class name, so CaseResult#getPackageName() resolves it to "(root)" --
+            // matching how the plugin itself derives and stores the "package" column -- while
+            // getClassName() (stored verbatim in the "classname" column) returns this full value.
+            String longClassName = "\u6d4b\u8bd5".repeat(MAX_CLASSNAME_LENGTH / 2); // 255 chars of CJK text
+            String longTestName = "\u6d4b\u8bd5".repeat(MAX_TEST_NAME_LENGTH / 2); // 500 chars of CJK text
+            String suite = "suite1";
+            String pkg = "(root)";
+
+            // Insert directly rather than through a real junit XML publish, to precisely control the
+            // exact identity values without needing to worry about XML-encoding such long/multibyte
+            // content; this also exercises the testidentityhash generated column on insert itself,
+            // which is where an oversized plain index would have failed.
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, errorDetails, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)")) {
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, build1.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, longClassName);
+                    insert.setString(6, longTestName);
+                    insert.setNull(7, Types.VARCHAR);
+                    insert.setFloat(8, 0.1f);
+                    insert.executeUpdate();
+
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, build2.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, longClassName);
+                    insert.setString(6, longTestName);
+                    insert.setString(7, "it broke");
+                    insert.setFloat(8, 0.1f);
+                    insert.executeUpdate();
+                }
+            }
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build2.getNumber());
+            SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+            CaseResult caseResult = new CaseResult(suiteResult, longClassName, longTestName, "it broke",
+                    null, 0.1f, null, null, null);
+
+            // When
+            var failedSinceRun = testResultStorage.getFailedSinceRun(caseResult);
+
+            // Then: the lookup both succeeds (no index-row-size error) and resolves to the actual
+            // first failing build, not some unrelated/collided identity.
+            assertNotNull(failedSinceRun);
+            assertEquals(build2.getNumber(), failedSinceRun.getNumber());
+        }
+    }
+
+    @Test
     void getCaseResults_mockDatabase() throws SQLException {
         // Given
         var databaseTestResultStorage = new DatabaseTestResultStorage();
@@ -699,6 +776,7 @@ class DatabaseTestResultStorageTest {
         mapOfColumnTypes.put("stderr", "VARCHAR");
         mapOfColumnTypes.put("stacktrace", "VARCHAR");
         mapOfColumnTypes.put("timestamp", "TIMESTAMP");
+        mapOfColumnTypes.put("testidentityhash", "VARCHAR");
         return mapOfColumnTypes;
     }
 

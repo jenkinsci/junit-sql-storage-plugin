@@ -1,10 +1,14 @@
 package io.jenkins.plugins.junit.storage.database;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Savepoint;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -497,6 +501,16 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             }
             var insertSql = "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
                     + "VALUES (?, ?, ?, ?, ?, ?)";
+            // A savepoint before the insert attempt lets us recover from a duplicate-key race on
+            // PostgreSQL without losing the rest of this chunk's transaction: once a statement fails
+            // with a constraint violation, PostgreSQL aborts the *entire* transaction until a rollback
+            // (full or to a savepoint) runs, so without this, retrying the UPDATE below would itself
+            // fail with "current transaction is aborted" (SQLState 25P02) and the whole chunk
+            // (including the caseResults rows already inserted earlier in this same transaction) would
+            // be rolled back by the caller. MySQL does not abort the transaction on a single statement
+            // failure the same way, but it supports savepoints too, so the same code path is safe and
+            // portable for both databases.
+            Savepoint savepoint = connection.setSavepoint();
             try (PreparedStatement insert = connection.prepareStatement(insertSql)) {
                 insert.setString(1, StringUtils.truncate(job, MAX_JOB_LENGTH));
                 insert.setInt(2, build);
@@ -515,6 +529,10 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 if (sqlState == null || !sqlState.startsWith("23")) {
                     throw x;
                 }
+                // Undo just the failed insert attempt (and, on PostgreSQL, clear the aborted-transaction
+                // state), leaving everything committed earlier in this transaction -- in particular the
+                // caseResults rows from this same chunk -- intact and still pending commit.
+                connection.rollback(savepoint);
                 try (PreparedStatement update = connection.prepareStatement(updateSql)) {
                     if (executeSummaryUpdate(update, passCount, failCount, skipCount, duration) == 0) {
                         throw x;
@@ -954,6 +972,17 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 var spanPassingBuild = createSpan("lastPassingBuild");
                 int lastPassingBuildNumber;
                 Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
+                // On PostgreSQL, failed_since_index is keyed on a bounded-size hash of
+                // (job, classname, testname) rather than those columns directly, since PostgreSQL btree
+                // indexes have a hard per-entry size limit that long/multibyte values in those columns
+                // can exceed (see V2026_10_07_0733__failed-since-index.sql in db/migration/postgres).
+                // MySQL supports indexing a length-limited column prefix instead, so its equivalent
+                // index can cover the full columns directly and does not need this. The original
+                // job/classname/testname equality filters are kept in both cases as exact-value
+                // residual checks, so a hash collision between two different tests cannot produce an
+                // incorrect match.
+                boolean postgres = isPostgres(connection);
+                String identityHashPredicate = postgres ? "AND testidentityhash = ? " : "";
                 String sqlPassingBuild = "SELECT build " +
                         "FROM caseResults " +
                         "WHERE job = ? " +
@@ -962,13 +991,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         "AND package = ? " +
                         "AND classname = ? " +
                         "AND testname = ? " +
+                        identityHashPredicate +
                         "AND errordetails IS NULL " +
                         "ORDER BY BUILD DESC " +
                         "LIMIT 1";
                 addSqlAttribute(spanPassingBuild, sqlPassingBuild);
                 try (PreparedStatement statement = connection.prepareStatement(sqlPassingBuild);
                      Scope ignore = spanPassingBuild.makeCurrent()) {
-                    addCaseResultToStatement(caseResult, build, statement);
+                    addCaseResultToStatement(caseResult, build, statement, postgres);
                     try (ResultSet result = statement.executeQuery()) {
                         boolean hasPassed = result.next();
                         if (!hasPassed) {
@@ -988,13 +1018,14 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         "AND package = ? " +
                         "AND classname = ? " +
                         "AND testname = ? " +
+                        identityHashPredicate +
                         "AND errordetails is NOT NULL " +
                         "ORDER BY BUILD ASC " +
                         "LIMIT 1";
                 addSqlAttribute(spanFailingBuild, sqlFailedBuild);
                 try (PreparedStatement statement = connection.prepareStatement(sqlFailedBuild);
                      Scope ignore = spanFailingBuild.makeCurrent()) {
-                    addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement);
+                    addCaseResultToStatement(caseResult, lastPassingBuildNumber, statement, postgres);
                     try (ResultSet result = statement.executeQuery()) {
                         result.next();
                         int firstFailingBuildAfterPassing = result.getInt("build");
@@ -1006,14 +1037,17 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             });
         }
 
-        private void addCaseResultToStatement(CaseResult caseResult, int build, PreparedStatement preparedStatement)
-                throws SQLException {
+        private void addCaseResultToStatement(CaseResult caseResult, int build, PreparedStatement preparedStatement,
+                boolean postgres) throws SQLException {
             preparedStatement.setString(1, job);
             preparedStatement.setInt(2, build);
             preparedStatement.setString(3, caseResult.getSuiteResult().getName());
             preparedStatement.setString(4, caseResult.getPackageName());
             preparedStatement.setString(5, caseResult.getClassName());
             preparedStatement.setString(6, caseResult.getName());
+            if (postgres) {
+                preparedStatement.setString(7, testIdentityHash(job, caseResult.getClassName(), caseResult.getName()));
+            }
         }
 
         @Override
@@ -1616,5 +1650,43 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
     private static Tracer getTracer() {
         return GlobalOpenTelemetry.getTracer("io.jenkins.plugins.junit.storage.database");
+    }
+
+    /**
+     * Whether the given connection is to PostgreSQL rather than MySQL, the two databases this
+     * plugin supports. Used to select the PostgreSQL-specific {@code testidentityhash}-based
+     * variant of the "failed since" lookup query (see {@code computeFailedSinceRun}), which exists
+     * because PostgreSQL's btree index entry size limit (unlike MySQL's prefix-length indexes)
+     * cannot safely index the full job/classname/testname columns directly.
+     */
+    private static boolean isPostgres(Connection connection) throws SQLException {
+        return "PostgreSQL".equals(connection.getMetaData().getDatabaseProductName());
+    }
+
+    /**
+     * Computes the same bounded-size identity hash as the {@code testidentityhash} stored
+     * generated column added by {@code V2026_10_07_0733__failed-since-index.sql} (PostgreSQL only),
+     * so queries can filter on it with a bind parameter rather than relying on the database to
+     * re-derive it. Null classname/testname are treated as empty strings, matching the column's
+     * {@code coalesce(..., '')} definition; a single {@code 0x01} byte separates each part so that,
+     * for example, {@code job="a", classname="bc"} cannot collide with {@code job="ab", classname="c"}.
+     */
+    private static String testIdentityHash(String job, String className, String testName) {
+        try {
+            MessageDigest md5 = MessageDigest.getInstance("MD5");
+            md5.update(Util.fixNull(job).getBytes(StandardCharsets.UTF_8));
+            md5.update((byte) 1);
+            md5.update(Util.fixNull(className).getBytes(StandardCharsets.UTF_8));
+            md5.update((byte) 1);
+            md5.update(Util.fixNull(testName).getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(32);
+            for (byte b : md5.digest()) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException x) {
+            // MD5 is a standard JVM algorithm guaranteed to be available (JLS/JCA baseline).
+            throw new IllegalStateException(x);
+        }
     }
 }

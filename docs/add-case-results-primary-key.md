@@ -37,9 +37,16 @@ Measured cost: roughly **24 seconds per million existing rows** (about 6m24s for
 on commodity SSD-backed storage. This scales with table size, so an 80M+ row production table could
 mean a startup delay of an hour or more.
 
-On PostgreSQL, adding a primary key is comparatively cheap (it builds a new unique btree index over
-existing rows, without MySQL's forced full-table rebuild), but it is still not free on a very large
-table, and Jenkins will be unable to serve `caseResults` reads/writes while it runs.
+On PostgreSQL, adding this primary key is *not* just "building a new unique index": the `id` column
+is declared `BIGSERIAL`, and adding a column with a non-null `DEFAULT`/`nextval()` expression forces
+PostgreSQL to rewrite the entire table (assigning every existing row's new `id` value), plus rebuild
+every other index on the table (since each index's tuples must reference the rewritten table's new
+physical row versions) — all under an `ACCESS EXCLUSIVE` lock for the whole operation, exactly the
+same "nothing else can read or write this table" exposure MySQL's rebuild has, just without MySQL's
+separate measured-benchmark numbers above. It is usually still faster than MySQL's equivalent
+because PostgreSQL does not also need to physically re-cluster row order as part of this, but it is
+not "comparatively cheap" on a very large table, and Jenkins will be unable to serve `caseResults`
+reads/writes while it runs.
 
 ## Recommended approach for large installs
 
@@ -75,10 +82,9 @@ you. It then:
 Once this has been applied, upgrading the plugin finds the `id` column and primary key already
 present, and its own Flyway migration becomes a no-op.
 
-There is currently no equivalent standalone script for PostgreSQL, since its default migration path
-is comparatively cheap relative to MySQL's forced full-table rebuild; very large Postgres installs
-that still want to avoid any startup delay can adapt the same create-new-table/bulk-copy/swap
-pattern manually.
+There is currently no equivalent standalone script for PostgreSQL. Its migration still requires a
+full table rewrite (see above), so very large Postgres installs that want to avoid any startup
+delay can adapt the same create-new-table/bulk-copy/swap pattern manually.
 
 ## Precondition: `job`/`build` must not be `NULL`
 

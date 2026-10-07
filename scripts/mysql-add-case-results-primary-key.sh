@@ -118,7 +118,17 @@ if [[ "$MODE" == "prepare" ]]; then
 
     echo "==> Bulk copying existing rows, ordered by (job, build) so the new table is written in its final clustered physical order"
     echo "    This is the slow part and scales with table size; caseResults remains fully readable/writable by Jenkins throughout."
-    run_sql "INSERT INTO caseResults_new (job, build, suite, package, className, testName, stdout, stderr, stacktrace, errorDetails, skipped, duration, timestamp)
+    # MySQL's default session isolation level, REPEATABLE READ, requires InnoDB to take shared
+    # next-key locks on every row an INSERT ... SELECT reads, held for the whole statement's
+    # duration -- for a multi-hour bulk copy over 80M+ rows, that would block concurrent publishers
+    # (INSERTs) and deletes against the *old* caseResults table for the whole copy, defeating the
+    # purpose of doing the slow copy online. READ COMMITTED only takes (and releases per-statement)
+    # record locks for rows it actually modifies, not plain consistent-read source rows, so it does
+    # not hold this statement's locks across the whole copy. The isolation level is session-scoped
+    # and must be set in the same session as (so before) the INSERT, which is why both are issued in
+    # one run_sql call here rather than two.
+    run_sql "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+             INSERT INTO caseResults_new (job, build, suite, package, className, testName, stdout, stderr, stacktrace, errorDetails, skipped, duration, timestamp)
              SELECT job, build, suite, package, className, testName, stdout, stderr, stacktrace, errorDetails, skipped, duration, timestamp
              FROM caseResults ORDER BY job, build;"
 
@@ -153,9 +163,13 @@ if [[ "$MODE" == "finalize" ]]; then
     echo "==> Catching up rows written since prepare's start watermark ($watermark), using a wide overlapping filter"
     # The anti-join compares every column that identifies a row's content (there is still no
     # existing row id to compare against); duplicate catch-up rows are prevented by matching the
-    # full row content, not just a timestamp. A small number of false negatives (genuinely new,
-    # byte-identical duplicate rows within the same second) are possible in theory; the row-count
-    # validation below is the authoritative safety net, not this filter.
+    # full row content -- including stdout/stderr/stacktrace/errorDetails/skipped, not just the
+    # identity+timing columns -- so a late-arriving row that shares identity, timestamp, and
+    # duration with an already-copied row but differs in its failure/output payload (e.g. a test
+    # that was re-run with the same timestamp precision but a different error) is not mistaken for
+    # a duplicate and skipped. A small number of false negatives (genuinely new, byte-identical
+    # duplicate rows within the same second) are possible in theory; the row-count validation below
+    # is the authoritative safety net, not this filter.
     run_sql "INSERT INTO caseResults_new (job, build, suite, package, className, testName, stdout, stderr, stacktrace, errorDetails, skipped, duration, timestamp)
              SELECT t.job, t.build, t.suite, t.package, t.className, t.testName, t.stdout, t.stderr, t.stacktrace, t.errorDetails, t.skipped, t.duration, t.timestamp
              FROM caseResults t
@@ -165,6 +179,8 @@ if [[ "$MODE" == "finalize" ]]; then
                    WHERE n.job = t.job AND n.build = t.build AND n.suite <=> t.suite
                      AND n.package <=> t.package AND n.className <=> t.className AND n.testName <=> t.testName
                      AND n.timestamp = t.timestamp AND n.duration <=> t.duration
+                     AND n.stdout <=> t.stdout AND n.stderr <=> t.stderr AND n.stacktrace <=> t.stacktrace
+                     AND n.errorDetails <=> t.errorDetails AND n.skipped <=> t.skipped
                );"
 
     old_count=$(run_sql "SELECT COUNT(*) FROM caseResults;")
