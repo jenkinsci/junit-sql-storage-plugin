@@ -140,6 +140,11 @@ acktrace |         timestamp
 If working with a larger number of test results you will want to increase the memory from the default.
 If you're using the dev server, e.g. `-Dmaven.hpi.run.jvmArgs=-Xms512M -Xmx3G -XX:+HeapDumpOnOutOfMemoryError`
 
+[scripts/benchmark](scripts/benchmark) has companion scripts for driving *many concurrent* builds
+(to exercise connection pooling/locking under load) and watching database activity while they run.
+They work against a local dev stack or a remote Jenkins/database -- see
+[scripts/benchmark/README.md](scripts/benchmark/README.md) for configuration and usage.
+
 ### Scaling to large test result history
 
 This plugin writes each build's test cases in batches (JDBC `addBatch`/`executeBatch`), but by default both
