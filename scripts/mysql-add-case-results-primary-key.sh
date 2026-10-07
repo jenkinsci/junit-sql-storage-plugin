@@ -72,7 +72,7 @@ done
 
 [[ -n "$HOST" && -n "$USER" && -n "$DATABASE" ]] || usage
 
-MYSQL=(mysql --host="$HOST" --port="$PORT" --user="$USER" --database="$DATABASE" --batch --silent)
+MYSQL=(mysql --host="$HOST" --port="$PORT" --user="$USER" --database="$DATABASE" --batch --silent --skip-column-names)
 if [[ -n "$PASSWORD" ]]; then
     export MYSQL_PWD="$PASSWORD"
 fi
@@ -170,27 +170,36 @@ if [[ "$MODE" == "finalize" ]]; then
     # a duplicate and skipped. A small number of false negatives (genuinely new, byte-identical
     # duplicate rows within the same second) are possible in theory; the row-count validation below
     # is the authoritative safety net, not this filter.
-    # All text-column comparisons are forced to BINARY so they compare raw bytes rather than the
-    # columns' (collation-dependent, often case-insensitive) default comparison. Without this, a
+    # job/build are compared with plain (non-BINARY) equality, deliberately: caseResults_new's
+    # primary key is (job, build, id), so an equality predicate on its leading columns lets MySQL
+    # use that index to narrow the match instead of scanning caseResults_new's full content for
+    # every candidate row -- this matters a lot for a write-paused catch-up pass against an 80M+ row
+    # table. The remaining columns are forced to BINARY so they compare raw bytes rather than their
+    # (collation-dependent, often case-insensitive) default comparison -- without this, a
     # late-arriving row whose text content only changed case (e.g. an error message changing from
     # "Error A" to "error a") could be wrongly treated as byte-identical to an already-copied row
     # and silently skipped as a duplicate; the row-count check afterwards would not catch this
     # since it only compares totals, not content.
+    # A LEFT JOIN (rather than a NOT EXISTS subquery referencing caseResults_new, the INSERT
+    # target) is used here because MySQL rejects "INSERT INTO t ... SELECT ... FROM ... WHERE NOT
+    # EXISTS (SELECT 1 FROM t ...)" with error 1093 ("You can't specify target table for update in
+    # FROM clause") whenever the target table is read back via a subquery; referencing it directly
+    # in the SELECT's own top-level FROM/JOIN clause (as opposed to nesting it in a subquery) is
+    # permitted.
     run_sql "INSERT INTO caseResults_new (job, build, suite, package, className, testName, stdout, stderr, stacktrace, errorDetails, skipped, duration, timestamp)
              SELECT t.job, t.build, t.suite, t.package, t.className, t.testName, t.stdout, t.stderr, t.stacktrace, t.errorDetails, t.skipped, t.duration, t.timestamp
              FROM caseResults t
+             LEFT JOIN caseResults_new n
+               ON n.job = t.job AND n.build = t.build
+              AND BINARY n.suite <=> BINARY t.suite
+              AND BINARY n.package <=> BINARY t.package AND BINARY n.className <=> BINARY t.className
+              AND BINARY n.testName <=> BINARY t.testName
+              AND n.timestamp = t.timestamp AND n.duration <=> t.duration
+              AND BINARY n.stdout <=> BINARY t.stdout AND BINARY n.stderr <=> BINARY t.stderr
+              AND BINARY n.stacktrace <=> BINARY t.stacktrace
+              AND BINARY n.errorDetails <=> BINARY t.errorDetails AND BINARY n.skipped <=> BINARY t.skipped
              WHERE t.timestamp >= (SELECT started_at FROM caseResultsMigrationWatermark LIMIT 1)
-               AND NOT EXISTS (
-                   SELECT 1 FROM caseResults_new n
-                   WHERE BINARY n.job = BINARY t.job AND n.build = t.build
-                     AND BINARY n.suite <=> BINARY t.suite
-                     AND BINARY n.package <=> BINARY t.package AND BINARY n.className <=> BINARY t.className
-                     AND BINARY n.testName <=> BINARY t.testName
-                     AND n.timestamp = t.timestamp AND n.duration <=> t.duration
-                     AND BINARY n.stdout <=> BINARY t.stdout AND BINARY n.stderr <=> BINARY t.stderr
-                     AND BINARY n.stacktrace <=> BINARY t.stacktrace
-                     AND BINARY n.errorDetails <=> BINARY t.errorDetails AND BINARY n.skipped <=> BINARY t.skipped
-               );"
+               AND n.id IS NULL;"
 
     old_count=$(run_sql "SELECT COUNT(*) FROM caseResults;")
     new_count=$(run_sql "SELECT COUNT(*) FROM caseResults_new;")
