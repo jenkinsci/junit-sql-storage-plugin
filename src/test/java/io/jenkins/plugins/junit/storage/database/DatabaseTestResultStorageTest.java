@@ -2,14 +2,17 @@ package io.jenkins.plugins.junit.storage.database;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -22,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 
 import com.google.common.collect.ImmutableSet;
+import hudson.Util;
 import hudson.model.Label;
 import hudson.model.Result;
 import hudson.slaves.DumbSlave;
@@ -30,14 +34,17 @@ import hudson.tasks.junit.HistoryTestResultSummary;
 import hudson.tasks.junit.PackageResult;
 import hudson.tasks.junit.SuiteResult;
 import hudson.tasks.junit.TestDurationResultSummary;
+import hudson.tasks.junit.TestResult;
 import hudson.tasks.junit.TestResultAction;
 import hudson.tasks.junit.TestResultSummary;
 import hudson.tasks.junit.TrendTestResultSummary;
 import hudson.util.Secret;
+import hudson.util.StreamTaskListener;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.apache.commons.io.FileUtils;
+import org.apache.tools.ant.DirectoryScanner;
 import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
 import org.jenkinsci.plugins.database.postgresql.PostgreSQLDatabase;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
@@ -58,10 +65,13 @@ import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_ERROR_DETAILS_LENGTH;
+import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_CLASSNAME_LENGTH;
 import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_SUITE_LENGTH;
+import static io.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.MAX_TEST_NAME_LENGTH;
 import static java.util.Objects.requireNonNull;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.equalToIgnoringCase;
 import static org.hamcrest.Matchers.hasKey;
@@ -73,6 +83,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @WithJenkins
 class DatabaseTestResultStorageTest {
@@ -444,6 +456,213 @@ class DatabaseTestResultStorageTest {
     }
 
     @Test
+    void failedSince_longMultibyteTestIdentity_postgres() throws Exception {
+        // Given: a job/classname/testname combination long enough and multibyte enough (CJK
+        // characters are 3 bytes each in UTF-8) that a plain btree index over the full columns would
+        // exceed PostgreSQL's per-entry index size limit -- this is exactly the scenario
+        // V2026_10_07_0733__failed-since-index.sql's testidentityhash-based index (rather than
+        // indexing job/classname/testname directly) exists to support. Regression test for
+        // https://github.com/jenkinsci/junit-sql-storage-plugin/pull/539#pullrequestreview-5439494112.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "longMultibyteIdentity");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+
+            // No '.' in the class name, so CaseResult#getPackageName() resolves it to "(root)" --
+            // matching how the plugin itself derives and stores the "package" column -- while
+            // getClassName() (stored verbatim in the "classname" column) returns this full value.
+            // High-entropy (non-repeating) CJK characters are used rather than a simple repeated
+            // pattern: PostgreSQL's TOAST storage transparently PGLZ-compresses long column/index
+            // values before storing them, and a short repeating pattern compresses so well that even
+            // a "long" value stays well under the per-entry index size limit after compression --
+            // which would make a test built from one make the plain-index assertion below pass for
+            // the wrong reason (looking long on paper, but not actually triggering the limit).
+            String longClassName = randomCjkText(MAX_CLASSNAME_LENGTH, 1); // 255 chars of CJK text
+            String longTestName = randomCjkText(MAX_TEST_NAME_LENGTH, 2); // 500 chars of CJK text
+            String suite = "suite1";
+            String pkg = "(root)";
+
+            // Insert directly rather than through a real junit XML publish, to precisely control the
+            // exact identity values without needing to worry about XML-encoding such long/multibyte
+            // content; this also exercises the testidentityhash generated column on insert itself,
+            // which is where an oversized plain index would have failed.
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, errorDetails, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)")) {
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, build1.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, longClassName);
+                    insert.setString(6, longTestName);
+                    insert.setNull(7, Types.VARCHAR);
+                    insert.setFloat(8, 0.1f);
+                    insert.executeUpdate();
+
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, build2.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, longClassName);
+                    insert.setString(6, longTestName);
+                    insert.setString(7, "it broke");
+                    insert.setFloat(8, 0.1f);
+                    insert.executeUpdate();
+                }
+            }
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build2.getNumber());
+            SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+            CaseResult caseResult = new CaseResult(suiteResult, longClassName, longTestName, "it broke",
+                    null, 0.1f, null, null, null);
+
+            // When
+            var failedSinceRun = testResultStorage.getFailedSinceRun(caseResult);
+
+            // Then: the lookup both succeeds (no index-row-size error) and resolves to the actual
+            // first failing build, not some unrelated/collided identity.
+            assertNotNull(failedSinceRun);
+            assertEquals(build2.getNumber(), failedSinceRun.getNumber());
+
+            // And: this fixture's (job, classname, testname) combination, if indexed directly rather
+            // than via the bounded-size testidentityhash, would actually exceed PostgreSQL's btree
+            // per-entry size limit -- proving this regression test's data would really have hit the
+            // bug a plain "(job, classname, testname, build)" index has, not just resembling it.
+            // longClassName/longTestName alone are already 765 + 1500 = 2265 UTF-8 bytes (and, being
+            // high-entropy, do not compress away); a synthetic (filesystem-unconstrained, since this
+            // probe never needs a real Jenkins job directory) job value of 150 CJK characters (450
+            // bytes) pushes the combined row comfortably past the ~2704-byte limit.
+            String oversizedJob = randomCjkText(150, 3); // 150 chars of CJK text, 450 bytes in UTF-8
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                    insert.setString(1, oversizedJob);
+                    insert.setInt(2, build1.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, longClassName);
+                    insert.setString(6, longTestName);
+                    insert.setFloat(7, 0.1f);
+                    insert.executeUpdate();
+                }
+                try (var statement = connection.createStatement()) {
+                    SQLException thrown = assertThrows(SQLException.class, () -> statement.execute(
+                            "CREATE INDEX proof_plain_identity_index ON caseResults (job, className, testName, build)"));
+                    assertThat(thrown.getMessage(), containsString("index row size"));
+                }
+            }
+        }
+    }
+
+    @Test
+    void publish_summaryFailureAfterBatchInsert_rollsBackChunkButKeepsEarlierChunk() throws Exception {
+        // Given: a build with more than MAX_DB_BATCH_SIZE (2000) cases, published as two chunks --
+        // the first chunk (2000 passing cases) flushed/committed successfully, the second chunk (500
+        // failing cases) engineered to fail during its caseResultsSummary upsert (via a trigger that
+        // raises an error whenever a row's failCount becomes positive) after its caseResults batch
+        // insert has already run in the same open transaction. Regression test for
+        // https://github.com/jenkinsci/junit-sql-storage-plugin/pull/539#pullrequestreview-5439872190
+        // (finding #3): proves that (a) a summary-maintenance failure after the case-batch insert
+        // rolls back both tables together for that chunk, and (b) an earlier chunk that already
+        // committed is unaffected by a later chunk's failure.
+        // Published directly via createRemotePublisher/publish (mirroring what JUnitParser does
+        // internally -- see hudson.tasks.junit.JUnitParser.ParseResultCallable#invoke) rather than
+        // through a real pipeline/junit step, since a 2500-testcase JUnit XML report embedded as a
+        // single inline Groovy string literal in a CPS pipeline script would exceed the JVM class
+        // file's 64KB string-constant limit.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            var workflowJob = jenkinsRule.createProject(WorkflowJob.class, "bulk-publish");
+            workflowJob.setDefinition(new CpsFlowDefinition("echo 'noop'", true));
+            WorkflowRun workflowRun = jenkinsRule.buildAndAssertSuccess(workflowJob);
+
+            int passingCases = DatabaseTestResultStorage.MAX_DB_BATCH_SIZE;
+            int failingCases = 500;
+            StringBuilder xml = new StringBuilder("<testsuite name='bulk'>");
+            for (int i = 0; i < passingCases; i++) {
+                xml.append("<testcase classname='Bulk' name='pass").append(i).append("' time='0.01'/>");
+            }
+            for (int i = 0; i < failingCases; i++) {
+                xml.append("<testcase classname='Bulk' name='fail").append(i)
+                        .append("' time='0.01'><error message='boom'/></testcase>");
+            }
+            xml.append("</testsuite>");
+            File reportsDir = Files.createTempDirectory("bulk-publish-reports").toFile();
+            FileUtils.writeStringToFile(new File(reportsDir, "x.xml"), xml.toString(), StandardCharsets.UTF_8);
+            DirectoryScanner directoryScanner = Util.createFileSet(reportsDir, "*.xml").getDirectoryScanner();
+            TestResult testResult = new TestResult(System.currentTimeMillis(), directoryScanner, false, false, null, false);
+            testResult.tally();
+
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                // Installed before publishing so the first chunk's upsert (all passing, never
+                // setting failCount above zero) succeeds normally, and only the second (failing)
+                // chunk's upsert trips it.
+                try (var statement = connection.createStatement()) {
+                    statement.execute(
+                            "CREATE OR REPLACE FUNCTION fail_on_positive_failcount() RETURNS trigger AS $$ "
+                                    + "BEGIN IF NEW.failcount > 0 THEN "
+                                    + "RAISE EXCEPTION 'injected failure for test'; END IF; RETURN NEW; END; $$ "
+                                    + "LANGUAGE plpgsql");
+                    statement.execute(
+                            "CREATE TRIGGER fail_on_positive_failcount_trigger BEFORE INSERT OR UPDATE "
+                                    + "ON caseresultssummary FOR EACH ROW "
+                                    + "EXECUTE FUNCTION fail_on_positive_failcount()");
+                }
+            }
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+            var publisher = storage.createRemotePublisher(workflowRun);
+            var listener = StreamTaskListener.fromStdout();
+            // When: publishing fails (the trigger rejects the second chunk's summary upsert).
+            assertThrows(IOException.class, () -> publisher.publish(testResult, listener));
+
+            // Then / And: verify persisted state directly against the database.
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement count = connection.prepareStatement(
+                        "SELECT COUNT(*) FROM caseResults WHERE job = ? AND build = ?")) {
+                    count.setString(1, workflowJob.getFullName());
+                    count.setInt(2, workflowRun.getNumber());
+                    try (ResultSet result = count.executeQuery()) {
+                        assertTrue(result.next());
+                        // Then: only the first, successfully committed chunk's rows (2000 passing
+                        // cases) are present; the second chunk's 500 failing-case rows, inserted in
+                        // the same transaction as the trigger-induced summary failure, were rolled
+                        // back along with it rather than left as orphaned detail rows.
+                        assertThat(result.getInt(1), is(passingCases));
+                    }
+                }
+                try (PreparedStatement summary = connection.prepareStatement(
+                        "SELECT passCount, failCount FROM caseResultsSummary WHERE job = ? AND build = ?")) {
+                    summary.setString(1, workflowJob.getFullName());
+                    summary.setInt(2, workflowRun.getNumber());
+                    try (ResultSet result = summary.executeQuery()) {
+                        assertTrue(result.next());
+                        // And: the summary row reflects only the first chunk too -- not left
+                        // half-updated with the second (rolled-back) chunk's counts.
+                        assertThat(result.getInt("passCount"), is(passingCases));
+                        assertThat(result.getInt("failCount"), is(0));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     void getCaseResults_mockDatabase() throws SQLException {
         // Given
         var databaseTestResultStorage = new DatabaseTestResultStorage();
@@ -730,6 +949,7 @@ class DatabaseTestResultStorageTest {
 
     private static @NonNull Map<String, String> getCaseResultsColumnTypes() {
         Map<String, String> mapOfColumnTypes = new HashMap<>();
+        mapOfColumnTypes.put("id", "bigserial");
         mapOfColumnTypes.put("job", "VARCHAR");
         mapOfColumnTypes.put("build", "INT4");
         mapOfColumnTypes.put("suite", "VARCHAR");
@@ -743,6 +963,7 @@ class DatabaseTestResultStorageTest {
         mapOfColumnTypes.put("stderr", "VARCHAR");
         mapOfColumnTypes.put("stacktrace", "VARCHAR");
         mapOfColumnTypes.put("timestamp", "TIMESTAMP");
+        mapOfColumnTypes.put("testidentityhash", "VARCHAR");
         return mapOfColumnTypes;
     }
 
@@ -869,6 +1090,23 @@ class DatabaseTestResultStorageTest {
     private static @NonNull MockitoInitializationException getMockException(int index,
             String columnLabel) {
         return new MockitoInitializationException("Did not expect " + index + "'" + columnLabel + "' calls");
+    }
+
+    /**
+     * Generates {@code length} pseudo-random (deterministically seeded, for reproducibility)
+     * characters from the CJK Unified Ideographs block (3 bytes each in UTF-8). Deliberately
+     * non-repeating, unlike a simple {@code "x".repeat(n)} pattern, so the result does not compress
+     * away under PostgreSQL's transparent TOAST/PGLZ compression -- a short repeating pattern can
+     * compress a "long" value down to a small fraction of its raw byte count, which would silently
+     * undermine any test relying on the raw (uncompressed) byte count exceeding a storage limit.
+     */
+    private static String randomCjkText(int length, long seed) {
+        var random = new java.util.Random(seed);
+        var text = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            text.append((char) (0x4E00 + random.nextInt(0x9FFF - 0x4E00)));
+        }
+        return text.toString();
     }
 
     private List<CaseResult> getCaseResults(String packageName, String className, int numPass, int numFail,

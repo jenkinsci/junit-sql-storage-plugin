@@ -140,6 +140,35 @@ acktrace |         timestamp
 If working with a larger number of test results you will want to increase the memory from the default.
 If you're using the dev server, e.g. `-Dmaven.hpi.run.jvmArgs=-Xms512M -Xmx3G -XX:+HeapDumpOnOutOfMemoryError`
 
+### Scaling to large test result history
+
+This plugin writes each build's test cases in batches (JDBC `addBatch`/`executeBatch`), but by default both
+the MySQL and PostgreSQL JDBC drivers still send each statement in a batch as its own round trip to the
+server unless batch rewriting is explicitly enabled on the connection. For installs with large numbers of
+test cases per build, enabling the driver's batch-rewriting option turns each flushed batch into a single
+multi-row `INSERT`, significantly reducing publish time and server-side overhead. Configure this as part of
+the JDBC URL/connection properties in the `database`/`database-mysql`/`database-postgresql` plugin's
+configuration (Manage Jenkins → Configure System → Global Database):
+
+* MySQL: append `rewriteBatchedStatements=true` to the JDBC URL.
+* PostgreSQL: append `reWriteBatchedInserts=true` to the JDBC URL (enabled by default since pgjdbc 42.x
+  in some distributions, but safe to set explicitly).
+
+If you have a job with a very large amount of test history (many thousands of builds, or very large
+per-build test case counts), be aware that:
+
+* Trend/history/duration pages read from a small persisted per-build summary table
+  (`caseResultsSummary`), not by aggregating `caseResults` on every request, so these stay fast regardless
+  of total history size.
+* "Failed since" lookups (shown next to failing tests) are served by a dedicated index on
+  `(job, classname, testname, build)`, so they stay fast even when a job's full history is tens of millions
+  of rows.
+* The `caseResults` table is clustered by `(job, build, id)` on MySQL (a primary key, so a single build's rows are stored contiguously on disk rather than scattered
+  in insertion order — this keeps single-build reads (history pages, build summaries, suite lookups) fast
+  even on large tables.
+  PostgreSQL also gains the primary key (for row identity/future maintenance tooling), but remains a heap
+  table — it does not get the same automatic physical-clustering read speedup MySQL does.
+
 ## Contributing
 
 Refer to our [contribution guidelines](https://github.com/jenkinsci/.github/blob/master/CONTRIBUTING.md)
