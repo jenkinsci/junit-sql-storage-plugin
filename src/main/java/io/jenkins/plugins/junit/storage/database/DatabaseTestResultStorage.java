@@ -1056,7 +1056,18 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         public SuiteResult getSuite(String suiteName) {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getSuite", span -> {
                 span.setAttribute("suite", suiteName);
-                log.fine(String.format("Getting suite result for suite %s from case results.", suiteName));
+                log.fine(() -> String.format("Getting suite result for suite %s from case results.", suiteName));
+                // Memoized per build: CaseResult#getPreviousResult() looks up the previous build's suite
+                // once per case of the current build (e.g. TestResult#getFixedCount()/#getRegressionCount()
+                // on the build's test report page walk every case). Rebuilding the suite on every call made
+                // one page render cost the sum over cases of their suite size -- for a build with 300k cases
+                // in suites of up to several thousand cases, hundreds of millions of objects, which never
+                // finished. A built suite is the same for every caller until the entry is invalidated.
+                ResultsEntry entry = getEntry();
+                SuiteResult cached = entry.suiteResultsByName.get(suiteName);
+                if (cached != null) {
+                    return cached;
+                }
                 SuiteResult suiteResult = new SuiteResult(suiteName, null, null, null);
                 // Looked up by suite name (not iterated), e.g. by CaseResult#getPreviousResult() walking
                 // up to PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX historical builds per failing test to
@@ -1066,14 +1077,17 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 // already rendered, which needs every suite anyway) and otherwise issue a narrow,
                 // suite-scoped query -- instead of hydrating every other suite's cases (and their stdout/
                 // stderr/stacktrace text) purely to resolve one historical suite lookup.
-                getEntry().getCasesForSuite(span, suiteName)
+                entry.getCasesForSuite(span, suiteName)
                         .forEach(caseResult -> {
                             TestResult testResult = new TestResult(this);
                             String packageName = caseResult.getPackageName();
                             String className = caseResult.getClassName();
                             populateSuiteResult(caseResult, testResult, className, packageName, suiteResult);
                         });
-                return suiteResult;
+                // Built outside the map so that the database query above does not run under a map lock;
+                // a concurrent caller that built the same suite first wins and both return its instance.
+                SuiteResult existing = entry.suiteResultsByName.putIfAbsent(suiteName, suiteResult);
+                return existing != null ? existing : suiteResult;
             });
         }
 
@@ -1253,6 +1267,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          * retained memory" contract that {@link #weight()} relies on for cache eviction.
          */
         private final AtomicInteger partialWeight = new AtomicInteger();
+
+        /**
+         * Suites built by {@link TestResultStorage#getSuite(String)}, keyed by suite name, so that each
+         * suite of this build is assembled at most once per cache generation. Holds the same
+         * {@link CaseResult} instances as the case lists above, so it adds no case rows to the weight.
+         */
+        private final Map<String, SuiteResult> suiteResultsByName = new ConcurrentHashMap<>();
 
         /**
          * Memoized result of looking up the previous build's {@link TestResult}, so that repeated
