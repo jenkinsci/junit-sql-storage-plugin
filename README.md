@@ -163,12 +163,18 @@ per-build test case counts), be aware that:
 * "Failed since" lookups (shown next to failing tests) are served by a dedicated index on
   `(job, classname, testname, build)`, so they stay fast even when a job's full history is tens of millions
   of rows.
-* The underlying `caseResults` table is not physically clustered by `(job, build)` (no clustering primary
-  key), so very large, long-lived installs may still see slower table scans/vacuum-adjacent maintenance
-  than a clustered layout would give. Addressing this requires an online table-rewrite (e.g. a copy-and-swap
-  migration), which is a higher-risk, operator-triggered change rather than something this plugin applies
-  automatically; see [issue #535](https://github.com/jenkinsci/junit-sql-storage-plugin/issues/535) for
-  background and a proposed migration approach if you are affected.
+* The `caseResults` table is clustered by `(job, build, id)` on MySQL (a primary key, added by this
+  plugin's own migration), so a single build's rows are stored contiguously on disk rather than scattered
+  in insertion order — this keeps single-build reads (history pages, build summaries, suite lookups) fast
+  even on very large tables. If your `caseResults` table is already very large, this migration's
+  `ALTER TABLE ... ADD PRIMARY KEY` is a blocking, full-table-rebuilding operation on MySQL (InnoDB always
+  rebuilds the table for this change) — roughly 24 seconds per million existing rows in testing, so a
+  large production table could mean a long, unplanned startup delay the first time you upgrade. Run
+  [`scripts/mysql-add-case-results-primary-key.sh`](scripts/mysql-add-case-results-primary-key.sh)
+  *before* upgrading to apply the equivalent change online, with only a brief write-paused window at the
+  end; see [`docs/add-case-results-primary-key.md`](docs/add-case-results-primary-key.md) for details.
+  PostgreSQL also gains the primary key (for row identity/future maintenance tooling), but remains a heap
+  table — it does not get the same automatic physical-clustering read speedup MySQL does.
 
 ## Contributing
 

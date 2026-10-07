@@ -685,6 +685,7 @@ class DatabaseTestResultStorageTest {
 
     private static @NonNull Map<String, String> getCaseResultsColumnTypes() {
         Map<String, String> mapOfColumnTypes = new HashMap<>();
+        mapOfColumnTypes.put("id", "bigserial");
         mapOfColumnTypes.put("job", "VARCHAR");
         mapOfColumnTypes.put("build", "INT4");
         mapOfColumnTypes.put("suite", "VARCHAR");
