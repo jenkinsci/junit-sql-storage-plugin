@@ -29,23 +29,40 @@ bench_log "Triggering ${BUILD_COUNT} builds of '${JOB_NAME}' at ${JENKINS_URL} (
 
 trigger_one() {
     local run_id="$1"
-    bench_curl -o /dev/null -s "${crumb_args[@]}" \
+    # --fail makes curl itself return a non-zero exit code on HTTP 4xx/5xx responses (by default it
+    # only fails on connection-level errors and treats a rejected request, e.g. 403/404, as success).
+    bench_curl -o /dev/null -s --fail "${crumb_args[@]}" \
         --data-urlencode "RUN_ID=${run_id}" \
         "${JENKINS_URL}/job/${JOB_NAME}/buildWithParameters"
 }
 
 start_epoch=$(date +%s)
 running=0
+failures=0
+pids=()
 for ((i = 1; i <= BUILD_COUNT; i++)); do
     trigger_one "bench-$(date +%s%N)-${i}" &
+    pids+=("$!")
     running=$((running + 1))
     if ((running >= CONCURRENCY)); then
-        wait
+        # A bare `wait` with no PIDs only waits for the jobs to finish, it does not propagate their
+        # individual exit codes, so each backgrounded trigger's PID is waited on and checked
+        # explicitly here to detect failed requests instead of silently discarding them.
+        for pid in "${pids[@]}"; do
+            wait "$pid" || failures=$((failures + 1))
+        done
+        pids=()
         running=0
     fi
 done
-wait
+for pid in "${pids[@]}"; do
+    wait "$pid" || failures=$((failures + 1))
+done
 bench_log "All ${BUILD_COUNT} trigger requests sent in $(( $(date +%s) - start_epoch ))s"
+if ((failures > 0)); then
+    bench_log "${failures} of ${BUILD_COUNT} trigger request(s) failed"
+    exit 1
+fi
 
 bench_log "Waiting for queue to drain..."
 while true; do

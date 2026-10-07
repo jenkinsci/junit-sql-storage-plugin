@@ -48,7 +48,8 @@ export DB_PASSWORD=xxxxxxxx   # kept only in your shell's environment, never wri
 
 ```bash
 # 1. Create a scripted-pipeline job that generates synthetic JUnit results and publishes them.
-#    Requires at least one agent matching AGENT_LABEL (default: "agent") with Python available.
+#    Requires at least one agent matching AGENT_LABEL (default: "agent") with Python 3 available
+#    (the generated script uses f-strings, so plain "python" must not resolve to Python 2).
 ./scripts/benchmark/create-load-job.sh
 
 # 2. In one terminal, watch database connection/lock activity while load runs.

@@ -35,25 +35,33 @@ PIPELINE_SCRIPT=$(cat <<GROOVY
 node('${AGENT_LABEL}') {
     dir("bench-\${env.BUILD_NUMBER}") {
         stage('Generate report') {
+            // The generator deliberately avoids any backslash escape sequences (no \" and no \n) in
+            // its source: this text passes through an unquoted Bash heredoc and then a Groovy
+            // triple-single-quoted string before it ever reaches Python, and both of those layers
+            // perform their own backslash-escape processing, so any \" or \n written here would be
+            // silently consumed before Python sees it. Using single-quoted f-strings for attribute
+            // values (so the literal double quotes they contain need no escaping) and print(...,
+            // file=f) (which appends the newline itself) sidesteps that entirely.
             writeFile file: 'gen.py', text: '''
-import random
 suite_count = ${PACKAGE_COUNT}
 case_count = ${CASE_COUNT}
-cases_per_suite = max(1, case_count // suite_count)
+base_cases_per_suite = max(1, case_count // suite_count)
+remainder = max(0, case_count - base_cases_per_suite * suite_count)
 idx = 0
 for s in range(suite_count):
+    cases_this_suite = base_cases_per_suite + (1 if s < remainder else 0)
     with open(f"result-{s}.xml", "w") as f:
-        f.write(f"<testsuite name=\\"bench.suite{s}\\" tests=\\"{cases_per_suite}\\">\\n")
-        for c in range(cases_per_suite):
+        print(f'<testsuite name="bench.suite{s}" tests="{cases_this_suite}">', file=f)
+        for c in range(cases_this_suite):
             idx += 1
             name = f"test{c}"
             if idx % 37 == 0:
-                f.write(f"<testcase classname=\\"bench.suite{s}.Klazz\\" name=\\"{name}\\" time=\\"0.01\\"><failure message=\\"synthetic failure {idx}\\"/></testcase>\\n")
+                print(f'<testcase classname="bench.suite{s}.Klazz" name="{name}" time="0.01"><failure message="synthetic failure {idx}"/></testcase>', file=f)
             elif idx % 53 == 0:
-                f.write(f"<testcase classname=\\"bench.suite{s}.Klazz\\" name=\\"{name}\\" time=\\"0.0\\"><skipped/></testcase>\\n")
+                print(f'<testcase classname="bench.suite{s}.Klazz" name="{name}" time="0.0"><skipped/></testcase>', file=f)
             else:
-                f.write(f"<testcase classname=\\"bench.suite{s}.Klazz\\" name=\\"{name}\\" time=\\"0.01\\"/>\\n")
-        f.write("</testsuite>\\n")
+                print(f'<testcase classname="bench.suite{s}.Klazz" name="{name}" time="0.01"/>', file=f)
+        print('</testsuite>', file=f)
 '''
             sh 'python3 gen.py || python gen.py'
         }

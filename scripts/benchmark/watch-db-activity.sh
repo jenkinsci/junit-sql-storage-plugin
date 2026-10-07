@@ -41,6 +41,10 @@ while (( $(date +%s) < end_epoch )); do
             bench_run_sql "SHOW STATUS LIKE 'Threads_connected';"
             bench_run_sql "SELECT * FROM performance_schema.data_locks LIMIT 10;"
             ;;
+        *)
+            bench_log "Unsupported DB_ENGINE '${DB_ENGINE}' (expected 'postgres' or 'mysql')"
+            exit 1
+            ;;
     esac
     sleep "$INTERVAL_SECONDS"
 done
