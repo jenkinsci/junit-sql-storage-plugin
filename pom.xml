@@ -55,6 +55,11 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>junit</artifactId>
+            <!-- TEMPORARY local benchmark override: pins to a locally-built junit-plugin SNAPSHOT
+                 exercising the new TestResultImpl#getPreviousCaseResult fast-path API. Must be removed
+                 (reverting to the BOM-managed released version) before this can be a real PR; the
+                 corresponding junit-plugin change needs to be reviewed/released there first. -->
+            <version>999-db85-SNAPSHOT</version>
         </dependency>
         <dependency>
             <groupId>io.jenkins.plugins</groupId>

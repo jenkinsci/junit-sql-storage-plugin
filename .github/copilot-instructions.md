@@ -7,6 +7,9 @@ writing test results to a SQL database (PostgreSQL or MySQL) instead of to `JENK
 
 This is a standard Jenkins plugin, built with Maven (parent POM `org.jenkins-ci.plugins:plugin`).
 
+This project requires at least Java 21.
+If you're changing the version locally make sure you set the PATH to include the right Java version and not just the JAVA_HOME, otherwise mock agents may fail to start.
+
 ```
 mvn clean package -P quick-build   # build the .hpi, skipping tests/checks for speed
 mvn clean test                     # run the full test suite
