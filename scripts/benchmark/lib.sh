@@ -43,8 +43,9 @@ bench_require() {
     }
 }
 
-# curl wrapper that authenticates (if JENKINS_USER/JENKINS_API_TOKEN are set) and shares a cookie
-# jar across calls so the CSRF crumb fetched by bench_crumb_header can be reused for POSTs.
+# curl wrapper that authenticates with JENKINS_USER/JENKINS_API_TOKEN (Basic auth, preferred) when
+# set, and otherwise shares a cookie jar across calls so an anonymous session's CSRF crumb (fetched
+# by bench_crumb_header) can be reused for POSTs.
 _BENCH_COOKIE_JAR="$(mktemp -t bench-jenkins-cookies.XXXXXX)"
 trap 'rm -f "$_BENCH_COOKIE_JAR"' EXIT
 
@@ -76,9 +77,15 @@ bench_json_query() {
 }
 
 # Fetches a CSRF crumb header (as a single "Name: value" string suitable for curl -H) bound to the
-# shared cookie jar above. Prints nothing and returns success if the instance has crumb issuance
-# disabled, so this is always safe to call before a POST.
+# shared cookie jar above. Prints nothing (and does not make a request) when JENKINS_USER/
+# JENKINS_API_TOKEN are set: Jenkins' CSRF protection only applies to session/cookie-authenticated
+# requests, so Basic-auth-with-API-token requests (what these scripts use whenever JENKINS_USER is
+# set) are exempt and never need a crumb. Also prints nothing and returns success if the instance
+# has crumb issuance disabled, so this is always safe to call before a POST either way.
 bench_crumb_header() {
+    if [[ -n "$JENKINS_USER" ]]; then
+        return 0
+    fi
     local crumb
     crumb="$(bench_curl -s "${JENKINS_URL}/crumbIssuer/api/json" 2>/dev/null \
         | sed -n 's/.*"crumbRequestField":"\([^"]*\)".*"crumb":"\([^"]*\)".*/\1: \2/p')"

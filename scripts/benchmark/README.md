@@ -21,8 +21,8 @@ All scripts source [`lib.sh`](lib.sh), which reads these environment variables (
 | Variable | Default | Purpose |
 |---|---|---|
 | `JENKINS_URL` | `http://localhost:8080` | Base URL of the Jenkins instance to drive |
-| `JENKINS_USER` | *(none, anonymous)* | Username for basic auth, if Jenkins requires login |
-| `JENKINS_API_TOKEN` | *(none)* | API token/password paired with `JENKINS_USER` |
+| `JENKINS_USER` | *(none, anonymous)* | Username for Basic auth; set this together with `JENKINS_API_TOKEN` (an API token from the user's Jenkins account page) rather than relying on anonymous/session access. Recommended whenever the instance has authentication enabled, and required for a remote Jenkins with CSRF protection and security enabled. |
+| `JENKINS_API_TOKEN` | *(none)* | API token paired with `JENKINS_USER`. When set, requests authenticate with Basic auth and skip fetching a CSRF crumb entirely -- Jenkins' crumb/CSRF check only applies to session (cookie) based requests, not to Basic-auth/API-token requests, so no crumb is needed or fetched in this mode. Without a token, scripts fall back to an anonymous session and fetch a crumb as needed. |
 | `LOAD_JOB_NAME` | `bench-concurrent-publish` | Name of the job the scripts create/trigger/delete |
 | `DB_EXEC_MODE` | `compose` | `compose` runs through the local `docker compose exec db ...` dev stack; `direct` connects straight to `DB_HOST`/`DB_PORT` (use this for a remote database) |
 | `DB_ENGINE` | `postgres` | `postgres` or `mysql` |
