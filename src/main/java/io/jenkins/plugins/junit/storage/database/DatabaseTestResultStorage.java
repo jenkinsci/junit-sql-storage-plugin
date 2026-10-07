@@ -1069,15 +1069,64 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
                 Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
 
-                // Cases that never passed before this build failed since build #1; everything else
-                // needs the first failing build strictly after its own last passing build (step 2).
+                // Cases that never passed before this build failed since their own earliest recorded
+                // occurrence (step 2a, batched below) -- not unconditionally build #1, since a test
+                // can be introduced, already failing, partway through the job's history. Everything
+                // else needs the first failing build strictly after its own last passing build (step 2b).
+                List<Integer> neverPassed = new ArrayList<>();
                 List<Integer> needsFailingLookup = new ArrayList<>();
                 for (int i = 0; i < chunk.size(); i++) {
                     if (!lastPassingByIdx.containsKey(i)) {
-                        entry.failedSinceRunByTest.putIfAbsent(
-                                failedSinceCacheKey(chunk.get(i)), theJob.getBuildByNumber(1));
+                        neverPassed.add(i);
                     } else {
                         needsFailingLookup.add(i);
+                    }
+                }
+
+                if (!neverPassed.isEmpty()) {
+                    StringBuilder earliestSql = new StringBuilder();
+                    for (int j = 0; j < neverPassed.size(); j++) {
+                        if (j > 0) {
+                            earliestSql.append(" UNION ALL ");
+                        }
+                        earliestSql.append("SELECT ").append(j).append(" AS idx, (SELECT MIN(build) FROM caseResults ")
+                                .append("WHERE job = ? AND suite = ? AND package = ? AND classname = ? AND testname = ? ")
+                                .append(identityHashPredicate)
+                                .append(") AS earliestbuild");
+                    }
+                    var spanEarliestBuild = createSpan("earliestBuildBatch");
+                    addSqlAttribute(spanEarliestBuild, earliestSql.toString());
+                    spanEarliestBuild.setAttribute("batchSize", neverPassed.size());
+                    try (PreparedStatement statement = connection.prepareStatement(earliestSql.toString());
+                         Scope ignore = spanEarliestBuild.makeCurrent()) {
+                        int paramIndex = 1;
+                        for (int idx : neverPassed) {
+                            CaseResult caseResult = chunk.get(idx);
+                            statement.setString(paramIndex++, job);
+                            statement.setString(paramIndex++, caseResult.getSuiteResult().getName());
+                            statement.setString(paramIndex++, caseResult.getPackageName());
+                            statement.setString(paramIndex++, caseResult.getClassName());
+                            statement.setString(paramIndex++, caseResult.getName());
+                            if (postgres) {
+                                statement.setString(paramIndex++, job);
+                                statement.setString(paramIndex++, caseResult.getClassName());
+                                statement.setString(paramIndex++, caseResult.getName());
+                            }
+                        }
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                int pos = result.getInt("idx");
+                                int earliest = result.getInt("earliestbuild");
+                                // MIN(build) should never be null -- this build itself always matches
+                                // its own identity -- but fall back to the current build defensively.
+                                int resolved = result.wasNull() ? build : earliest;
+                                CaseResult caseResult = chunk.get(neverPassed.get(pos));
+                                entry.failedSinceRunByTest.putIfAbsent(
+                                        failedSinceCacheKey(caseResult), theJob.getBuildByNumber(resolved));
+                            }
+                        }
+                    } finally {
+                        spanEarliestBuild.end();
                     }
                 }
 
@@ -1375,7 +1424,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     try (ResultSet result = statement.executeQuery()) {
                         boolean hasPassed = result.next();
                         if (!hasPassed) {
-                            return theJob.getBuildByNumber(1);
+                            // Never passed (in the data retained so far): failed since the earliest
+                            // build that actually contains this test identity, not build #1 -- the
+                            // test may have been introduced, e.g., in build #100, in which case that
+                            // is the correct "failed since" build, matching what the build-by-build
+                            // walk in CaseResult.getPreviousResult() would have found.
+                            return theJob.getBuildByNumber(earliestBuildForIdentity(connection, caseResult, postgres));
                         }
                         lastPassingBuildNumber = result.getInt("build");
                     }
@@ -1422,6 +1476,49 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 preparedStatement.setString(7, job);
                 preparedStatement.setString(8, caseResult.getClassName());
                 preparedStatement.setString(9, caseResult.getName());
+            }
+        }
+
+        /**
+         * Finds the earliest build that contains this exact test identity (any status), for a test
+         * that has no earlier passing build recorded. Since it never passed, that earliest occurrence
+         * is itself the first failing build -- including when the test was introduced partway through
+         * the job's history (e.g. first appearing, already failing, in build #100), rather than
+         * unconditionally blaming build #1 as if the test had always existed.
+         */
+        private int earliestBuildForIdentity(Connection connection, CaseResult caseResult, boolean postgres)
+                throws SQLException {
+            String identityHashPredicate = postgres
+                    ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
+                    : "";
+            String sql = "SELECT MIN(build) AS build FROM caseResults " +
+                    "WHERE job = ? AND suite = ? AND package = ? AND classname = ? AND testname = ? " +
+                    identityHashPredicate;
+            var span = createSpan("earliestBuildForIdentity");
+            addSqlAttribute(span, sql);
+            try (PreparedStatement statement = connection.prepareStatement(sql);
+                 Scope ignore = span.makeCurrent()) {
+                int paramIndex = 1;
+                statement.setString(paramIndex++, job);
+                statement.setString(paramIndex++, caseResult.getSuiteResult().getName());
+                statement.setString(paramIndex++, caseResult.getPackageName());
+                statement.setString(paramIndex++, caseResult.getClassName());
+                statement.setString(paramIndex++, caseResult.getName());
+                if (postgres) {
+                    statement.setString(paramIndex++, job);
+                    statement.setString(paramIndex++, caseResult.getClassName());
+                    statement.setString(paramIndex++, caseResult.getName());
+                }
+                try (ResultSet result = statement.executeQuery()) {
+                    result.next();
+                    int earliest = result.getInt("build");
+                    // MIN(build) should never be null here -- this build itself always matches its own
+                    // identity -- but fall back to the current build rather than propagating a bogus 0
+                    // if that invariant is ever violated (e.g. unexpected concurrent data changes).
+                    return result.wasNull() ? build : earliest;
+                }
+            } finally {
+                span.end();
             }
         }
 

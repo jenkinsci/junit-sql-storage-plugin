@@ -80,6 +80,7 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.core.Is.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -562,6 +563,94 @@ class DatabaseTestResultStorageTest {
                     assertThat(thrown.getMessage(), containsString("index row size"));
                 }
             }
+        }
+    }
+
+    @Test
+    void failedSince_testNeverPassed_reportsEarliestOccurrenceNotBuildOne() throws Exception {
+        // Given: two test identities that are introduced partway through the job's history and have
+        // never passed since. Regression test for
+        // https://github.com/jenkinsci/junit-sql-storage-plugin/pull/1269#pullrequestreview-5448810318
+        // (finding: "SQL backend reports build #1 instead of first failing build") -- the "no prior
+        // passing build" branch of both computeFailedSinceRun (single-case) and
+        // computeFailedSinceBatchChunk (batched) previously assumed the test had existed and failed
+        // since build #1, rather than looking up when it actually first appeared.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "neverPassedIdentity");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build3 = jenkinsRule.buildAndAssertSuccess(p);
+            jenkinsRule.buildAndAssertSuccess(p); // build4
+            WorkflowRun build5 = jenkinsRule.buildAndAssertSuccess(p);
+
+            String suite = "suite1";
+            String pkg = "(root)";
+            String className = "NeverPassedTest";
+            // Still currently failing in build #5 -- covered by the batched path
+            // (computeFailedSinceBatchChunk), since the Jelly views always load every currently
+            // failing case of the current build in one go.
+            String stillFailingTestName = "testIntroducedFailingStillFailing";
+            // No row at all in build #5 (e.g. the test was since removed) -- not covered by the
+            // batch, so resolving it exercises the single-case fallback path (computeFailedSinceRun).
+            String removedTestName = "testIntroducedFailingThenRemoved";
+
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, errorDetails, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)")) {
+                    // No row at all in builds 1-2 (not introduced yet), then a failing row in builds
+                    // 3, 4, and 5 -- never passed since it was introduced.
+                    for (WorkflowRun build : List.of(build3, build5)) {
+                        insert.setString(1, p.getFullName());
+                        insert.setInt(2, build.getNumber());
+                        insert.setString(3, suite);
+                        insert.setString(4, pkg);
+                        insert.setString(5, className);
+                        insert.setString(6, stillFailingTestName);
+                        insert.setString(7, "it broke");
+                        insert.setFloat(8, 0.1f);
+                        insert.executeUpdate();
+                    }
+                    // Only a single failing row, in build #2, and no row in any later build
+                    // (including build #5) -- never passed, and absent from build #5's case list.
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, build2.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, className);
+                    insert.setString(6, removedTestName);
+                    insert.setString(7, "it broke");
+                    insert.setFloat(8, 0.1f);
+                    insert.executeUpdate();
+                }
+            }
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build5.getNumber());
+            SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+
+            // When/Then: the still-failing case, resolved via the batched path.
+            CaseResult stillFailingCase = new CaseResult(suiteResult, className, stillFailingTestName, "it broke",
+                    null, 0.1f, null, null, null);
+            var stillFailingSinceRun = testResultStorage.getFailedSinceRun(stillFailingCase);
+            assertNotNull(stillFailingSinceRun);
+            assertEquals(build3.getNumber(), stillFailingSinceRun.getNumber());
+            assertNotEquals(build1.getNumber(), stillFailingSinceRun.getNumber());
+
+            // When/Then: the removed case, resolved via the single-case fallback path.
+            CaseResult removedCase = new CaseResult(suiteResult, className, removedTestName, "it broke",
+                    null, 0.1f, null, null, null);
+            var removedSinceRun = testResultStorage.getFailedSinceRun(removedCase);
+            assertNotNull(removedSinceRun);
+            assertEquals(build2.getNumber(), removedSinceRun.getNumber());
+            assertNotEquals(build1.getNumber(), removedSinceRun.getNumber());
         }
     }
 
