@@ -163,16 +163,9 @@ per-build test case counts), be aware that:
 * "Failed since" lookups (shown next to failing tests) are served by a dedicated index on
   `(job, classname, testname, build)`, so they stay fast even when a job's full history is tens of millions
   of rows.
-* The `caseResults` table is clustered by `(job, build, id)` on MySQL (a primary key, added by this
-  plugin's own migration), so a single build's rows are stored contiguously on disk rather than scattered
+* The `caseResults` table is clustered by `(job, build, id)` on MySQL (a primary key, so a single build's rows are stored contiguously on disk rather than scattered
   in insertion order — this keeps single-build reads (history pages, build summaries, suite lookups) fast
-  even on very large tables. If your `caseResults` table is already very large, this migration's
-  `ALTER TABLE ... ADD PRIMARY KEY` is a blocking, full-table-rebuilding operation on MySQL (InnoDB always
-  rebuilds the table for this change) — roughly 24 seconds per million existing rows in testing, so a
-  large production table could mean a long, unplanned startup delay the first time you upgrade. Run
-  [`scripts/mysql-add-case-results-primary-key.sh`](scripts/mysql-add-case-results-primary-key.sh)
-  *before* upgrading to apply the equivalent change online, with only a brief write-paused window at the
-  end; see [`docs/add-case-results-primary-key.md`](docs/add-case-results-primary-key.md) for details.
+  even on large tables.
   PostgreSQL also gains the primary key (for row identity/future maintenance tooling), but remains a heap
   table — it does not get the same automatic physical-clustering read speedup MySQL does.
 
