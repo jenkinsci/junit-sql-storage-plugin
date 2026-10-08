@@ -107,7 +107,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      * than referencing that package-private field directly, since it lives in a different package in
      * the junit-plugin module.
      */
-    private static final int PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX = Integer.getInteger(
+    static final int PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX = Integer.getInteger(
             "hudson.tasks.junit.History$HistoryTableResult.PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX", 25);
 
     /**
@@ -1121,8 +1121,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 // its own identity -- but fall back to the current build defensively.
                                 int resolved = result.wasNull() ? build : earliest;
                                 CaseResult caseResult = chunk.get(neverPassed.get(pos));
-                                entry.failedSinceRunByTest.putIfAbsent(
-                                        failedSinceCacheKey(caseResult), theJob.getBuildByNumber(resolved));
+                                Run<?, ?> run = theJob.getBuildByNumber(resolved);
+                                // getBuildByNumber can return null for a discarded build; only cache
+                                // a hit, since ConcurrentHashMap#putIfAbsent rejects null values.
+                                if (run != null) {
+                                    entry.failedSinceRunByTest.putIfAbsent(failedSinceCacheKey(caseResult), run);
+                                }
                             }
                         }
                     } finally {
@@ -1142,7 +1146,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 .append(identityHashPredicate)
                                 .append("AND errordetails IS NOT NULL ORDER BY build ASC LIMIT 1) AS firstfailing");
                     }
-                    var spanFailingBuild = createSpan("lastFailingBuildBatch");
+                    var spanFailingBuild = createSpan("firstFailingBuildBatch");
                     addSqlAttribute(spanFailingBuild, failingSql.toString());
                     spanFailingBuild.setAttribute("batchSize", needsFailingLookup.size());
                     Map<Integer, Integer> firstFailingByPos = new HashMap<>();
@@ -1170,7 +1174,11 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         // NULL"); fall back to the current build rather than failing the whole page if
                         // that invariant is ever violated (e.g. unexpected concurrent data changes).
                         Run<?, ?> run = theJob.getBuildByNumber(firstFailingBuild != null ? firstFailingBuild : build);
-                        entry.failedSinceRunByTest.putIfAbsent(failedSinceCacheKey(caseResult), run);
+                        // getBuildByNumber can return null for a discarded build; only cache a hit,
+                        // since ConcurrentHashMap#putIfAbsent rejects null values.
+                        if (run != null) {
+                            entry.failedSinceRunByTest.putIfAbsent(failedSinceCacheKey(caseResult), run);
+                        }
                     }
                 }
                 return null;
