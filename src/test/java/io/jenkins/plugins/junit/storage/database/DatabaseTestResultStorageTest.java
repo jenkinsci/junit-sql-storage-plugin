@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
@@ -43,12 +44,10 @@ import hudson.util.Secret;
 import hudson.util.StreamTaskListener;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
-import javax.sql.DataSource;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.apache.commons.io.FileUtils;
-import org.apache.commons.pool2.impl.GenericObjectPool;
 import org.apache.tools.ant.DirectoryScanner;
-import org.jenkinsci.plugins.database.BasicDataSource2;
+import org.jenkinsci.plugins.database.Database;
 import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
 import org.jenkinsci.plugins.database.mysql.MySQLDatabase;
 import org.jenkinsci.plugins.database.postgresql.PostgreSQLDatabase;
@@ -1384,37 +1383,36 @@ class DatabaseTestResultStorageTest {
     void agentPoolClosesConnectionsInsteadOfKeepingThemIdle() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             postgres.start();
-            // Built the same way Database#getDataSource() builds it.
-            BasicDataSource2 factory = new BasicDataSource2();
-            factory.setDriverClassName(postgres.getDriverClassName());
-            factory.setUrl(postgres.getJdbcUrl());
-            factory.setUsername(postgres.getUsername());
-            factory.setPassword(postgres.getPassword());
-            DataSource dataSource = factory.createDataSource();
-            try {
-                var pool = (GenericObjectPool<?>) DatabaseTestResultStorage.RemoteConnectionSupplier.poolOf(dataSource);
-                assertNotNull(pool);
-                try (Connection connection = dataSource.getConnection()) {
-                    assertTrue(connection.isValid(5));
-                }
-                assertThat(pool.getNumIdle(), is(1));
+            PostgreSQLDatabase database = new PostgreSQLDatabase(postgres.getHost() + ":" + postgres.getMappedPort(5432),
+                    postgres.getDatabaseName(), postgres.getUsername(), Secret.fromString(postgres.getPassword()), null);
+            database.setValidationQuery("SELECT 1");
 
-                DatabaseTestResultStorage.RemoteConnectionSupplier.limitIdleConnections(dataSource);
-                assertThat(pool.getMaxIdle(), is(0));
-                // The connection that was already idle is closed too.
-                assertThat(pool.getNumIdle(), is(0));
+            Database agentDatabase = DatabaseTestResultStorage.RemoteDatabaseCache.prepareForAgent(database);
 
-                try (Connection connection = dataSource.getConnection()) {
-                    assertTrue(connection.isValid(5));
-                    assertThat(pool.getNumActive(), is(1));
-                }
-                // Returned to the pool and closed right away: nothing stays open on the database.
-                assertThat(pool.getNumActive(), is(0));
-                assertThat(pool.getNumIdle(), is(0));
-            } finally {
-                factory.close();
+            try (Connection connection = agentDatabase.getDataSource().getConnection()) {
+                assertTrue(connection.isValid(5));
             }
+
+            // Returned to the agent-side pool and closed right away: nothing stays open on the
+            // database, unlike the default pool behavior exercised below for the controller. The
+            // server may take a moment to notice the closed socket, so poll briefly.
+            assertEventuallyEquals(0, () -> countServerConnections(postgres, database.username));
         }
+    }
+
+    /** Polls {@code actual} for up to 5s until it returns {@code expected}, then asserts equality. */
+    private static void assertEventuallyEquals(int expected, java.util.concurrent.Callable<Integer> actual)
+            throws Exception {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        int last;
+        do {
+            last = actual.call();
+            if (last == expected) {
+                return;
+            }
+            Thread.sleep(100);
+        } while (System.nanoTime() < deadline);
+        assertEquals(expected, last);
     }
 
     @Test
@@ -1458,18 +1456,28 @@ class DatabaseTestResultStorageTest {
     void remoteSupplierOnControllerKeepsTheSharedPoolIdleConnections() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
-            var controllerPool = (GenericObjectPool<?>) DatabaseTestResultStorage.RemoteConnectionSupplier.poolOf(
-                    requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource());
-            assertNotNull(controllerPool);
-            int maxIdle = controllerPool.getMaxIdle();
 
             // A build on the built-in node publishes through RemoteConnectionSupplier on the controller.
             try (Connection connection = new DatabaseTestResultStorage.RemoteConnectionSupplier().connection()) {
                 assertTrue(connection.isValid(5));
             }
 
-            assertThat(controllerPool.getMaxIdle(), is(maxIdle));
-            assertTrue(controllerPool.getNumIdle() > 0, "controller pool must keep the returned connection idle");
+            assertTrue(countServerConnections(postgres, postgres.getUsername()) > 0,
+                    "controller pool must keep the returned connection idle at the database");
+        }
+    }
+
+    /** Connections currently open on {@code postgres} for {@code username}, from any other client. */
+    private static int countServerConnections(PostgreSQLContainer<?> postgres, String username) throws SQLException {
+        try (Connection verify = DriverManager.getConnection(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
+             PreparedStatement ps = verify.prepareStatement(
+                     "SELECT count(*) FROM pg_stat_activity WHERE usename = ? AND pid <> pg_backend_pid() "
+                             + "AND backend_type = 'client backend'")) {
+            ps.setString(1, username);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
         }
     }
 

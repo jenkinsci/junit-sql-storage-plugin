@@ -1,7 +1,6 @@
 package io.jenkins.plugins.junit.storage.database;
 
 import java.io.IOException;
-import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -24,7 +23,6 @@ import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
-import javax.sql.DataSource;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -58,10 +56,7 @@ import io.opentelemetry.context.Scope;
 import jenkins.model.Jenkins;
 import jenkins.security.SlaveToMasterCallable;
 import jenkins.util.SystemProperties;
-import org.apache.commons.dbcp2.PoolingDataSource;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.commons.pool2.ObjectPool;
-import org.apache.commons.pool2.impl.GenericObjectPool;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.database.Database;
 import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
@@ -568,11 +563,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         protected void initialize(Connection connection) throws SQLException {}
 
-        /** The pool connections are borrowed from; {@link Database#getDataSource()} unless overridden. */
-        protected DataSource dataSource() throws SQLException {
-            return database().getDataSource();
-        }
-
         /**
          * Returns a fresh connection borrowed from {@link Database#getDataSource()}'s pool.
          *
@@ -587,7 +577,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          * what they get, typically via try-with-resources.
          */
         Connection connection() throws SQLException {
-            Connection _connection = dataSource().getConnection();
+            Connection _connection = database().getDataSource().getConnection();
             try {
                 initialize(_connection);
             } catch (SQLException | RuntimeException e) {
@@ -633,8 +623,21 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static class RemoteConnectionSupplier extends ConnectionSupplier implements SerializableOnlyOverRemoting {
 
         /**
-         * Maximum idle connections kept by the connection pool on an agent, see {@link #dataSource()}.
-         * Read from the agent JVM's system properties.
+         * Maximum idle connections kept by the agent-side connection pool, see
+         * {@link RemoteDatabaseCache#prepareForAgent}. Read from the agent JVM's system properties.
+         *
+         * <p>An agent only borrows connections to publish test results, a few times per build, so an
+         * idle pooled connection is almost never reused there. Kept idle (the default, 8, inherited
+         * from {@link Database#getDataSource()}'s pool), it holds a database connection for the whole
+         * life of the agent JVM. Worse, when an agent machine disappears without closing its sockets
+         * (a terminated cloud or spot/preemptible VM), the database keeps those connections open
+         * until its own idle timeout or TCP keepalive notices, which by default takes hours. With many
+         * short-lived agents this exhausts {@code max_connections} on the database for every other
+         * client. {@code maxTotal} still caps how many connections an agent can hold at once.
+         *
+         * <p>Not applied on the controller: a build on the built-in node publishes through the
+         * controller's own shared pool, which serves every test result page and must keep its idle
+         * connections.
          */
         static final int AGENT_MAX_IDLE = SystemProperties.getInteger(
                 DatabaseTestResultStorage.class.getName() + ".agentMaxIdle", 0);
@@ -668,60 +671,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         @Override protected Database database() {
             return RemoteDatabaseCache.canonicalize(database);
         }
-
-        /**
-         * The agent-side pool with idle connections disabled: a connection is closed as soon as it is
-         * returned instead of being kept for reuse.
-         *
-         * <p>An agent only borrows connections to publish test results, a few times per build, so an
-         * idle pooled connection is almost never reused there. Kept idle, it holds a database
-         * connection for the whole life of the agent JVM, i.e. up to {@code maxIdle} (8 by default)
-         * per agent. Worse, when an agent machine disappears without closing its sockets (a
-         * terminated cloud or spot/preemptible VM), the database keeps those connections open until
-         * its own idle timeout or TCP keepalive notices, which by default takes hours. With many
-         * short-lived agents this exhausts {@code max_connections} on the database for every other
-         * client. {@code maxTotal} still caps how many connections an agent can hold at once.
-         *
-         * <p>Applied only in an agent JVM: a build on the built-in node publishes from the controller,
-         * where this resolves to the controller's own shared pool, which serves every test result page
-         * and must keep its idle connections.
-         */
-        @Override protected DataSource dataSource() throws SQLException {
-            DataSource dataSource = super.dataSource();
-            if (Jenkins.getInstanceOrNull() == null) {
-                limitIdleConnections(dataSource);
-            }
-            return dataSource;
-        }
-
-        static void limitIdleConnections(DataSource dataSource) {
-            if (poolOf(dataSource) instanceof GenericObjectPool<?> pool && pool.getMaxIdle() != AGENT_MAX_IDLE) {
-                pool.setMaxIdle(AGENT_MAX_IDLE);
-                // Close whatever is already sitting idle; returns are closed from now on.
-                pool.clear();
-            }
-        }
-
-        /**
-         * The object pool behind a data source from {@link Database#getDataSource()}. That method
-         * returns the {@link PoolingDataSource} built by {@code BasicDataSource#createDataSource()},
-         * whose pool is only reachable through the protected {@link PoolingDataSource#getPool()}.
-         * Null if it cannot be reached, in which case the pool is left as it is.
-         */
-        @CheckForNull
-        static ObjectPool<?> poolOf(DataSource dataSource) {
-            if (!(dataSource instanceof PoolingDataSource<?>)) {
-                return null;
-            }
-            try {
-                Method getPool = PoolingDataSource.class.getDeclaredMethod("getPool");
-                getPool.setAccessible(true);
-                return (ObjectPool<?>) getPool.invoke(dataSource);
-            } catch (ReflectiveOperationException | RuntimeException e) {
-                log.log(Level.FINE, "Cannot reach the connection pool; leaving its idle connections as they are", e);
-                return null;
-            }
-        }
     }
 
     /**
@@ -746,7 +695,23 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             // added here applies to every publish from the agent. Not on the controller, where this
             // is the global configuration object itself.
             return CACHE.computeIfAbsent(key,
-                    k -> Jenkins.getInstanceOrNull() == null ? withMySqlBatchRewrite(database) : database);
+                    k -> Jenkins.getInstanceOrNull() == null ? prepareForAgent(database) : database);
+        }
+
+        /**
+         * Tunes a copy of {@code database} for agent-side use: enables the MySQL batch rewrite
+         * (see {@link #withMySqlBatchRewrite}) and caps the idle connections its pool keeps open
+         * (see {@link RemoteConnectionSupplier#AGENT_MAX_IDLE}) once, since the result is cached per
+         * agent JVM by {@link #canonicalize}.
+         */
+        static Database prepareForAgent(Database database) {
+            Database agentDatabase = withMySqlBatchRewrite(database);
+            try {
+                agentDatabase.setMaxIdleConnections(RemoteConnectionSupplier.AGENT_MAX_IDLE);
+            } catch (SQLException | RuntimeException e) {
+                log.log(Level.FINE, "Cannot limit idle connections; leaving them as they are", e);
+            }
+            return agentDatabase;
         }
 
         private static final String MYSQL_DATABASE_CLASS = "org.jenkinsci.plugins.database.mysql.MySQLDatabase";
