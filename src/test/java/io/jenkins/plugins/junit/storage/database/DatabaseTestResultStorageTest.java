@@ -19,6 +19,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -80,6 +81,7 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.core.Is.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -562,6 +564,241 @@ class DatabaseTestResultStorageTest {
                     assertThat(thrown.getMessage(), containsString("index row size"));
                 }
             }
+        }
+    }
+
+    @Test
+    void failedSince_testNeverPassed_reportsEarliestOccurrenceNotBuildOne() throws Exception {
+        // Given: two test identities that are introduced partway through the job's history and have
+        // never passed since. Both computeFailedSinceRun (single-case) and
+        // computeFailedSinceBatchChunk (batched) must report the test's actual earliest occurrence as
+        // its "failed since" build, not unconditionally build #1.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "neverPassedIdentity");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build3 = jenkinsRule.buildAndAssertSuccess(p);
+            jenkinsRule.buildAndAssertSuccess(p); // build4
+            WorkflowRun build5 = jenkinsRule.buildAndAssertSuccess(p);
+
+            String suite = "suite1";
+            String pkg = "(root)";
+            String className = "NeverPassedTest";
+            // Still currently failing in build #5 -- covered by the batched path
+            // (computeFailedSinceBatchChunk), since the Jelly views always load every currently
+            // failing case of the current build in one go.
+            String stillFailingTestName = "testIntroducedFailingStillFailing";
+            // No row at all in build #5 (e.g. the test was since removed) -- not covered by the
+            // batch, so resolving it exercises the single-case fallback path (computeFailedSinceRun).
+            String removedTestName = "testIntroducedFailingThenRemoved";
+
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, errorDetails, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)")) {
+                    // No row at all in builds 1-2 (not introduced yet), then a failing row in builds
+                    // 3 and 5 only -- never passed since it was introduced.
+                    for (WorkflowRun build : List.of(build3, build5)) {
+                        insert.setString(1, p.getFullName());
+                        insert.setInt(2, build.getNumber());
+                        insert.setString(3, suite);
+                        insert.setString(4, pkg);
+                        insert.setString(5, className);
+                        insert.setString(6, stillFailingTestName);
+                        insert.setString(7, "it broke");
+                        insert.setFloat(8, 0.1f);
+                        insert.executeUpdate();
+                    }
+                    // Only a single failing row, in build #2, and no row in any later build
+                    // (including build #5) -- never passed, and absent from build #5's case list.
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, build2.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, className);
+                    insert.setString(6, removedTestName);
+                    insert.setString(7, "it broke");
+                    insert.setFloat(8, 0.1f);
+                    insert.executeUpdate();
+                }
+            }
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build5.getNumber());
+            SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+
+            // When/Then: the still-failing case, resolved via the batched path.
+            CaseResult stillFailingCase = new CaseResult(suiteResult, className, stillFailingTestName, "it broke",
+                    null, 0.1f, null, null, null);
+            var stillFailingSinceRun = testResultStorage.getFailedSinceRun(stillFailingCase);
+            assertNotNull(stillFailingSinceRun);
+            assertEquals(build3.getNumber(), stillFailingSinceRun.getNumber());
+            assertNotEquals(build1.getNumber(), stillFailingSinceRun.getNumber());
+
+            // When/Then: the removed case, resolved via the single-case fallback path.
+            CaseResult removedCase = new CaseResult(suiteResult, className, removedTestName, "it broke",
+                    null, 0.1f, null, null, null);
+            var removedSinceRun = testResultStorage.getFailedSinceRun(removedCase);
+            assertNotNull(removedSinceRun);
+            assertEquals(build2.getNumber(), removedSinceRun.getNumber());
+            assertNotEquals(build1.getNumber(), removedSinceRun.getNumber());
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_returnsNearestMatchOrEmptyWhenNoHistoricalMatch() throws Exception {
+        // Given: a job history with a case present in build #1 and #2, absent in build #3, and
+        // present again in the current build #4 -- plus a second case only present in build #4.
+        // Regression/behavioral coverage for DatabaseTestResultStorage's SQL-backed implementation of
+        // TestResultImpl#getPreviousCaseResult(CaseResult), which CaseResult#getPreviousResult() uses
+        // as a fast path instead of its own build-by-build walk; this proves the SQL path finds the
+        // same nearest historical match that walk would (skipping over the build with no row), and
+        // correctly reports no match (not a crash or wrong match) when none exists.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultNearestMatch");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+            jenkinsRule.buildAndAssertSuccess(p); // build3, deliberately has no row for matchedTestName
+            WorkflowRun build4 = jenkinsRule.buildAndAssertSuccess(p);
+
+            String suite = "suite1";
+            String pkg = "(root)";
+            String className = "PreviousCaseResultTest";
+            String matchedTestName = "testWithHistory";
+            String unmatchedTestName = "testNeverSeenBefore";
+
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                    // matchedTestName: present in builds 1, 2, and 4 (current) -- deliberately absent
+                    // from build 3, so the nearest historical match for build 4 is build 2, not 3.
+                    for (var entry : Map.of(build1.getNumber(), 1.0f, build2.getNumber(), 2.0f,
+                            build4.getNumber(), 4.0f).entrySet()) {
+                        insert.setString(1, p.getFullName());
+                        insert.setInt(2, entry.getKey());
+                        insert.setString(3, suite);
+                        insert.setString(4, pkg);
+                        insert.setString(5, className);
+                        insert.setString(6, matchedTestName);
+                        insert.setFloat(7, entry.getValue());
+                        insert.executeUpdate();
+                    }
+                    // unmatchedTestName: only present in the current build, no historical occurrence.
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, build4.getNumber());
+                    insert.setString(3, suite);
+                    insert.setString(4, pkg);
+                    insert.setString(5, className);
+                    insert.setString(6, unmatchedTestName);
+                    insert.setFloat(7, 4.5f);
+                    insert.executeUpdate();
+                }
+            }
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build4.getNumber());
+            SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+
+            // When/Then: the nearest historical match (build #2, not #3 or #1) is found.
+            CaseResult matchedCurrent =
+                    new CaseResult(suiteResult, className, matchedTestName, null, null, 4.0f, null, null, null);
+            Optional<CaseResult> previous = testResultStorage.getPreviousCaseResult(matchedCurrent);
+            assertTrue(previous.isPresent());
+            assertEquals(2.0f, previous.get().getDuration(), 0.0001f);
+
+            // When/Then: a case with no historical occurrence resolves to empty, not a crash or an
+            // unrelated match.
+            CaseResult unmatchedCurrent =
+                    new CaseResult(suiteResult, className, unmatchedTestName, null, null, 4.5f, null, null, null);
+            assertEquals(Optional.empty(), testResultStorage.getPreviousCaseResult(unmatchedCurrent));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_doesNotMatchBeyondBacktrackLimit() throws Exception {
+        // Given: a case present only in build #1 and in the current build, with every build in
+        // between (more than PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX of them) having no row for it
+        // at all. Mirrors hudson.tasks.junit.CaseResult#PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX's
+        // own bound on how far the default build-by-build walk is willing to look back -- the SQL
+        // fast path must honor the same bound rather than scanning every build ever recorded.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultBacktrackLimit");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+
+            int totalBuilds = DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX + 2;
+            WorkflowRun firstBuild = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun currentBuild = firstBuild;
+            for (int i = 2; i <= totalBuilds; i++) {
+                currentBuild = jenkinsRule.buildAndAssertSuccess(p);
+            }
+
+            String suite = "suite1";
+            String pkg = "(root)";
+            String className = "PreviousCaseResultTest";
+            String testName = "testOutsideBacktrackWindow";
+            String fillerTestName = "testPresentInEveryBuild";
+
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection()) {
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                    for (int build : new int[] {firstBuild.getNumber(), currentBuild.getNumber()}) {
+                        insert.setString(1, p.getFullName());
+                        insert.setInt(2, build);
+                        insert.setString(3, suite);
+                        insert.setString(4, pkg);
+                        insert.setString(5, className);
+                        insert.setString(6, testName);
+                        insert.setFloat(7, 1.0f);
+                        insert.executeUpdate();
+                    }
+                    // An unrelated case present in every build strictly between the first and current
+                    // builds, so those builds count as candidate (published-results) builds and push
+                    // the backtrack window's lower bound past build #1 -- otherwise build #1 would be
+                    // (wrongly, for this test's purpose) the *only* candidate build and therefore
+                    // always within range regardless of the backtrack limit.
+                    for (int build = firstBuild.getNumber() + 1; build < currentBuild.getNumber(); build++) {
+                        insert.setString(1, p.getFullName());
+                        insert.setInt(2, build);
+                        insert.setString(3, suite);
+                        insert.setString(4, pkg);
+                        insert.setString(5, className);
+                        insert.setString(6, fillerTestName);
+                        insert.setFloat(7, 1.0f);
+                        insert.executeUpdate();
+                    }
+                }
+            }
+
+            var testResultStorage = (DatabaseTestResultStorage.TestResultStorage)
+                    storage.load(p.getFullName(), currentBuild.getNumber());
+            SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+            CaseResult current = new CaseResult(suiteResult, className, testName, null, null, 1.0f, null, null, null);
+
+            // When/Then: build #1's occurrence is outside the backtrack window from the current
+            // build, so no previous result is found -- not an unbounded scan that would have found it.
+            assertEquals(Optional.empty(), testResultStorage.getPreviousCaseResult(current));
         }
     }
 

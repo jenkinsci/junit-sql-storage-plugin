@@ -80,6 +80,37 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int MAX_DB_BATCH_SIZE = 2000;
 
     /**
+     * Number of failing {@link CaseResult}s whose "failed since" build is looked up in a single SQL
+     * round trip (see {@code computeFailedSinceBatch}), rather than one round trip per failing case.
+     * A test-report page lists every failing case and queries each one's "failed since" build, so
+     * without batching, a build with hundreds of failing cases issued hundreds of sequential queries;
+     * each query itself is index-backed and fast, but with a real (non-localhost) database connection
+     * the per-round-trip network latency dominates and multiplies directly by the failing case count.
+     * Batching trades a larger single query (one {@code UNION ALL} branch per case, each an exact copy
+     * of the original single-case subquery) for a bounded number of round trips. Kept well under
+     * typical driver/database parameter-count and query-size limits.
+     */
+    static final int FAILED_SINCE_BATCH_SIZE = 200;
+
+    /**
+     * Same rationale and shape as {@link #FAILED_SINCE_BATCH_SIZE}, but for
+     * {@link TestResultImpl#getPreviousCaseResult(CaseResult)}: a test-report page calls
+     * {@link CaseResult#getPreviousResult()} once per case of the current build (not just failing
+     * ones), so batching matters even more here.
+     */
+    static final int PREVIOUS_CASE_RESULT_BATCH_SIZE = 200;
+
+    /**
+     * Mirrors {@code hudson.tasks.junit.CaseResult#PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX}: the
+     * number of historical builds {@link CaseResult#getPreviousResult()} is willing to consider when
+     * looking for a case with the same identity. Read independently (same system property key) rather
+     * than referencing that package-private field directly, since it lives in a different package in
+     * the junit-plugin module.
+     */
+    static final int PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX = Integer.getInteger(
+            "hudson.tasks.junit.History$HistoryTableResult.PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX", 25);
+
+    /**
      * Upper bound on the total number of {@link CaseResult}s kept resident across all cached builds
      * at once, used as the {@link Caffeine#maximumWeight} for {@link #resultsCache}. Entries are
      * weighed by case count (a proxy for memory footprint, since per-case payloads such as stdout/
@@ -927,14 +958,434 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             return withSpan("DatabaseTestResultStorage.TestResultStorage.getFailedSinceRun", span -> {
                 span.setAttribute("build", build);
                 span.setAttribute("job", job);
-                // Memoized per (build, test identity): Jelly views (e.g. the failed-tests list on the
-                // build/test-report pages) call this once per failing case to show its "failed since"
-                // build, so without caching, a build with many failing cases would issue up to two SQL
-                // queries per case on every single page render.
-                String cacheKey = caseResult.getSuiteResult().getName() + '\0' + caseResult.getPackageName()
-                        + '\0' + caseResult.getClassName() + '\0' + caseResult.getName();
-                return getEntry().getFailedSinceRun(cacheKey, () -> computeFailedSinceRun(span, caseResult));
+                ResultsEntry entry = getEntry();
+                // Jelly views (e.g. the failed-tests list on the build/test-report pages) call this
+                // once per failing case shown on the page, so on the very first call for this build,
+                // eagerly compute "failed since" for every currently-failing case in as few round
+                // trips as possible (see computeFailedSinceBatch), rather than one pair of queries per
+                // case. Each individual query is index-backed and cheap on its own (a few
+                // milliseconds), but hundreds of sequential round trips to a non-localhost database
+                // multiply directly by per-round-trip network latency and can dominate page load time.
+                ensureFailedSinceBatchComputed(span, entry);
+                String cacheKey = failedSinceCacheKey(caseResult);
+                Run<?, ?> cached = entry.failedSinceRunByTest.get(cacheKey);
+                if (cached != null) {
+                    return cached;
+                }
+                // Not covered by the batch (e.g. called for a currently-passing case, or a case not
+                // present in this build's loaded case list): fall back to the original single-case
+                // lookup, still memoized per test identity for this build.
+                return entry.getFailedSinceRun(cacheKey, () -> computeFailedSinceRun(span, caseResult));
             });
+        }
+
+        private String failedSinceCacheKey(CaseResult caseResult) {
+            return caseResult.getSuiteResult().getName() + '\0' + caseResult.getPackageName()
+                    + '\0' + caseResult.getClassName() + '\0' + caseResult.getName();
+        }
+
+        /**
+         * Runs {@link #computeFailedSinceBatch(Span, ResultsEntry)} at most once per {@link ResultsEntry}
+         * (i.e. once per build per cache generation), guarded the same way as the other lazily-computed
+         * fields on {@link ResultsEntry}.
+         */
+        private void ensureFailedSinceBatchComputed(Span span, ResultsEntry entry) {
+            if (entry.failedSinceBatchComputed) {
+                return;
+            }
+            synchronized (entry.failedSinceBatchLock) {
+                if (entry.failedSinceBatchComputed) {
+                    return;
+                }
+                computeFailedSinceBatch(span, entry);
+                entry.failedSinceBatchComputed = true;
+            }
+        }
+
+        /**
+         * Computes "failed since" for every currently-failing case of this build in a bounded number
+         * of SQL round trips (see {@link #FAILED_SINCE_BATCH_SIZE}), storing each result directly into
+         * {@link ResultsEntry#failedSinceRunByTest} keyed the same way as {@link #getFailedSinceRun}.
+         * Reuses the already-loaded case list (no extra query to enumerate failing cases, since the
+         * Jelly views that call {@link #getFailedSinceRun} always first call {@link #getFailedTests()}
+         * or otherwise already have the full case list loaded for this build).
+         */
+        private void computeFailedSinceBatch(Span span, ResultsEntry entry) {
+            List<CaseResult> failing = entry.getCaseResults(span).stream()
+                    .filter(caseResult -> caseResult.getErrorDetails() != null)
+                    .collect(Collectors.toList());
+            for (int start = 0; start < failing.size(); start += FAILED_SINCE_BATCH_SIZE) {
+                List<CaseResult> chunk = failing.subList(start,
+                        Math.min(start + FAILED_SINCE_BATCH_SIZE, failing.size()));
+                computeFailedSinceBatchChunk(entry, chunk);
+            }
+        }
+
+        private void computeFailedSinceBatchChunk(ResultsEntry entry, List<CaseResult> chunk) {
+            query(connection -> {
+                boolean postgres = isPostgres(connection);
+                // See computeFailedSinceRun for why this predicate (and its bound job/classname/testname
+                // parameters) is only needed on PostgreSQL.
+                String identityHashPredicate = postgres
+                        ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
+                        : "";
+
+                // Step 1: last passing build before this one, for every failing case in the chunk, in
+                // one query built from one UNION ALL branch per case -- each branch is an exact copy of
+                // the single-case query in computeFailedSinceRun, just labelled with its chunk index so
+                // results can be matched back to the case they belong to.
+                StringBuilder passingSql = new StringBuilder();
+                for (int i = 0; i < chunk.size(); i++) {
+                    if (i > 0) {
+                        passingSql.append(" UNION ALL ");
+                    }
+                    passingSql.append("SELECT ").append(i).append(" AS idx, (SELECT build FROM caseResults ")
+                            .append("WHERE job = ? AND build < ? AND suite = ? AND package = ? ")
+                            .append("AND classname = ? AND testname = ? ")
+                            .append(identityHashPredicate)
+                            .append("AND errordetails IS NULL ORDER BY build DESC LIMIT 1) AS lastpassing");
+                }
+                var spanPassingBuild = createSpan("lastPassingBuildBatch");
+                addSqlAttribute(spanPassingBuild, passingSql.toString());
+                spanPassingBuild.setAttribute("batchSize", chunk.size());
+                Map<Integer, Integer> lastPassingByIdx = new HashMap<>();
+                try (PreparedStatement statement = connection.prepareStatement(passingSql.toString());
+                     Scope ignore = spanPassingBuild.makeCurrent()) {
+                    int paramIndex = 1;
+                    for (CaseResult caseResult : chunk) {
+                        paramIndex = bindFailedSinceParams(caseResult, build, statement, paramIndex, postgres);
+                    }
+                    try (ResultSet result = statement.executeQuery()) {
+                        while (result.next()) {
+                            int lastPassing = result.getInt("lastpassing");
+                            if (!result.wasNull()) {
+                                lastPassingByIdx.put(result.getInt("idx"), lastPassing);
+                            }
+                        }
+                    }
+                } finally {
+                    spanPassingBuild.end();
+                }
+
+                Job<?, ?> theJob = Objects.requireNonNull(Jenkins.get().getItemByFullName(job, Job.class));
+
+                // Cases that never passed before this build failed since their own earliest recorded
+                // occurrence (step 2a, batched below) -- not unconditionally build #1, since a test
+                // can be introduced, already failing, partway through the job's history. Everything
+                // else needs the first failing build strictly after its own last passing build (step 2b).
+                List<Integer> neverPassed = new ArrayList<>();
+                List<Integer> needsFailingLookup = new ArrayList<>();
+                for (int i = 0; i < chunk.size(); i++) {
+                    if (!lastPassingByIdx.containsKey(i)) {
+                        neverPassed.add(i);
+                    } else {
+                        needsFailingLookup.add(i);
+                    }
+                }
+
+                if (!neverPassed.isEmpty()) {
+                    StringBuilder earliestSql = new StringBuilder();
+                    for (int j = 0; j < neverPassed.size(); j++) {
+                        if (j > 0) {
+                            earliestSql.append(" UNION ALL ");
+                        }
+                        earliestSql.append("SELECT ").append(j).append(" AS idx, (SELECT MIN(build) FROM caseResults ")
+                                .append("WHERE job = ? AND suite = ? AND package = ? AND classname = ? AND testname = ? ")
+                                .append(identityHashPredicate)
+                                .append(") AS earliestbuild");
+                    }
+                    var spanEarliestBuild = createSpan("earliestBuildBatch");
+                    addSqlAttribute(spanEarliestBuild, earliestSql.toString());
+                    spanEarliestBuild.setAttribute("batchSize", neverPassed.size());
+                    try (PreparedStatement statement = connection.prepareStatement(earliestSql.toString());
+                         Scope ignore = spanEarliestBuild.makeCurrent()) {
+                        int paramIndex = 1;
+                        for (int idx : neverPassed) {
+                            CaseResult caseResult = chunk.get(idx);
+                            statement.setString(paramIndex++, job);
+                            statement.setString(paramIndex++, caseResult.getSuiteResult().getName());
+                            statement.setString(paramIndex++, caseResult.getPackageName());
+                            statement.setString(paramIndex++, caseResult.getClassName());
+                            statement.setString(paramIndex++, caseResult.getName());
+                            if (postgres) {
+                                statement.setString(paramIndex++, job);
+                                statement.setString(paramIndex++, caseResult.getClassName());
+                                statement.setString(paramIndex++, caseResult.getName());
+                            }
+                        }
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                int pos = result.getInt("idx");
+                                int earliest = result.getInt("earliestbuild");
+                                // MIN(build) should never be null -- this build itself always matches
+                                // its own identity -- but fall back to the current build defensively.
+                                int resolved = result.wasNull() ? build : earliest;
+                                CaseResult caseResult = chunk.get(neverPassed.get(pos));
+                                Run<?, ?> run = theJob.getBuildByNumber(resolved);
+                                // getBuildByNumber can return null for a discarded build; only cache
+                                // a hit, since ConcurrentHashMap#putIfAbsent rejects null values.
+                                if (run != null) {
+                                    entry.failedSinceRunByTest.putIfAbsent(failedSinceCacheKey(caseResult), run);
+                                }
+                            }
+                        }
+                    } finally {
+                        spanEarliestBuild.end();
+                    }
+                }
+
+                if (!needsFailingLookup.isEmpty()) {
+                    StringBuilder failingSql = new StringBuilder();
+                    for (int j = 0; j < needsFailingLookup.size(); j++) {
+                        if (j > 0) {
+                            failingSql.append(" UNION ALL ");
+                        }
+                        failingSql.append("SELECT ").append(j).append(" AS idx, (SELECT build FROM caseResults ")
+                                .append("WHERE job = ? AND build > ? AND suite = ? AND package = ? ")
+                                .append("AND classname = ? AND testname = ? ")
+                                .append(identityHashPredicate)
+                                .append("AND errordetails IS NOT NULL ORDER BY build ASC LIMIT 1) AS firstfailing");
+                    }
+                    var spanFailingBuild = createSpan("firstFailingBuildBatch");
+                    addSqlAttribute(spanFailingBuild, failingSql.toString());
+                    spanFailingBuild.setAttribute("batchSize", needsFailingLookup.size());
+                    Map<Integer, Integer> firstFailingByPos = new HashMap<>();
+                    try (PreparedStatement statement = connection.prepareStatement(failingSql.toString());
+                         Scope ignore = spanFailingBuild.makeCurrent()) {
+                        int paramIndex = 1;
+                        for (int idx : needsFailingLookup) {
+                            paramIndex = bindFailedSinceParams(
+                                    chunk.get(idx), lastPassingByIdx.get(idx), statement, paramIndex, postgres);
+                        }
+                        try (ResultSet result = statement.executeQuery()) {
+                            while (result.next()) {
+                                firstFailingByPos.put(result.getInt("idx"), result.getInt("firstfailing"));
+                            }
+                        }
+                    } finally {
+                        spanFailingBuild.end();
+                    }
+                    for (int j = 0; j < needsFailingLookup.size(); j++) {
+                        int idx = needsFailingLookup.get(j);
+                        CaseResult caseResult = chunk.get(idx);
+                        Integer firstFailingBuild = firstFailingByPos.get(j);
+                        // firstFailingBuild should always be present (the current, currently-failing
+                        // build itself always satisfies "build > lastPassing AND errordetails IS NOT
+                        // NULL"); fall back to the current build rather than failing the whole page if
+                        // that invariant is ever violated (e.g. unexpected concurrent data changes).
+                        Run<?, ?> run = theJob.getBuildByNumber(firstFailingBuild != null ? firstFailingBuild : build);
+                        // getBuildByNumber can return null for a discarded build; only cache a hit,
+                        // since ConcurrentHashMap#putIfAbsent rejects null values.
+                        if (run != null) {
+                            entry.failedSinceRunByTest.putIfAbsent(failedSinceCacheKey(caseResult), run);
+                        }
+                    }
+                }
+                return null;
+            });
+        }
+
+        private int bindFailedSinceParams(CaseResult caseResult, int build, PreparedStatement preparedStatement,
+                int paramIndex, boolean postgres) throws SQLException {
+            preparedStatement.setString(paramIndex++, job);
+            preparedStatement.setInt(paramIndex++, build);
+            preparedStatement.setString(paramIndex++, caseResult.getSuiteResult().getName());
+            preparedStatement.setString(paramIndex++, caseResult.getPackageName());
+            preparedStatement.setString(paramIndex++, caseResult.getClassName());
+            preparedStatement.setString(paramIndex++, caseResult.getName());
+            if (postgres) {
+                preparedStatement.setString(paramIndex++, job);
+                preparedStatement.setString(paramIndex++, caseResult.getClassName());
+                preparedStatement.setString(paramIndex++, caseResult.getName());
+            }
+            return paramIndex;
+        }
+
+        @Override
+        public boolean supportsPreviousCaseResultLookup() {
+            return true;
+        }
+
+        @Override
+        public Optional<CaseResult> getPreviousCaseResult(CaseResult current) {
+            return withSpan("DatabaseTestResultStorage.TestResultStorage.getPreviousCaseResult", span -> {
+                span.setAttribute("build", build);
+                span.setAttribute("job", job);
+                ResultsEntry entry = getEntry();
+                // CaseResult#getPreviousResult() is called once per case shown on a test-report page
+                // (not just failing ones) to compute per-case "age"/regression info, and its default
+                // implementation walks up to PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX historical
+                // builds per case, each needing its own suite-scoped query -- for a build with
+                // thousands of cases this previously multiplied into tens of thousands of suite loads
+                // for a single page render. Eagerly resolve every case's previous result for this
+                // build up front in a bounded number of round trips instead (see
+                // computePreviousCaseResultBatch), the same technique used for "failed since" above.
+                ensurePreviousCaseResultBatchComputed(span, entry);
+                // Absence here means "the batch determined there is no previous result" (the normal
+                // case for most tests, since the batch is seeded from this build's own full case
+                // list), not "not yet computed" -- so this never needs the single-case fallback that
+                // getFailedSinceRun uses, as long as current belongs to this build's case list.
+                return Optional.ofNullable(entry.previousCaseResultByTest.get(previousCaseResultCacheKey(current)));
+            });
+        }
+
+        private String previousCaseResultCacheKey(CaseResult caseResult) {
+            return caseResult.getSuiteResult().getName() + '\0' + caseResult.getPackageName()
+                    + '\0' + caseResult.getClassName() + '\0' + caseResult.getName();
+        }
+
+        /**
+         * Runs {@link #computePreviousCaseResultBatch(Span, ResultsEntry)} at most once per
+         * {@link ResultsEntry}, guarded the same way as {@link #ensureFailedSinceBatchComputed}.
+         */
+        private void ensurePreviousCaseResultBatchComputed(Span span, ResultsEntry entry) {
+            if (entry.previousCaseResultBatchComputed) {
+                return;
+            }
+            synchronized (entry.previousCaseResultBatchLock) {
+                if (entry.previousCaseResultBatchComputed) {
+                    return;
+                }
+                computePreviousCaseResultBatch(span, entry);
+                entry.previousCaseResultBatchComputed = true;
+            }
+        }
+
+        /**
+         * Resolves "previous result" for every case of this build in a bounded number of round trips:
+         * one query to find the (at most {@link #PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX}) candidate
+         * historical builds, then one {@code UNION ALL}-based identity-match query per
+         * {@link #PREVIOUS_CASE_RESULT_BATCH_SIZE}-sized chunk of cases to find which of those builds
+         * (if any) contains a matching case for each -- instead of one suite load per historical build
+         * visited per case.
+         */
+        private void computePreviousCaseResultBatch(Span span, ResultsEntry entry) {
+            List<CaseResult> cases = entry.getCaseResults(span);
+            if (cases.isEmpty()) {
+                return;
+            }
+            // Builds already present in caseResults are exactly the builds that published results, so
+            // the lowest of the most recent PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX distinct builds
+            // below this one, used as a numeric lower bound, covers precisely the same set of builds
+            // as an explicit IN-list would -- without needing to bind one parameter per candidate.
+            List<Integer> candidateBuilds = getPreviousBuildNumbers(PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX);
+            if (candidateBuilds.isEmpty()) {
+                return;
+            }
+            int minCandidateBuild = Collections.min(candidateBuilds);
+            for (int start = 0; start < cases.size(); start += PREVIOUS_CASE_RESULT_BATCH_SIZE) {
+                List<CaseResult> chunk = cases.subList(start,
+                        Math.min(start + PREVIOUS_CASE_RESULT_BATCH_SIZE, cases.size()));
+                computePreviousCaseResultBatchChunk(entry, chunk, minCandidateBuild);
+            }
+        }
+
+        /** The at most {@code limit} most recent distinct build numbers below this build in {@code caseResults}. */
+        private List<Integer> getPreviousBuildNumbers(int limit) {
+            return query(connection -> {
+                var sql =
+                        "SELECT DISTINCT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT ?";
+                try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                    statement.setString(1, job);
+                    statement.setInt(2, build);
+                    statement.setInt(3, limit);
+                    try (ResultSet result = statement.executeQuery()) {
+                        List<Integer> builds = new ArrayList<>();
+                        while (result.next()) {
+                            builds.add(result.getInt("build"));
+                        }
+                        return builds;
+                    }
+                }
+            });
+        }
+
+        private void computePreviousCaseResultBatchChunk(ResultsEntry entry, List<CaseResult> chunk,
+                int minCandidateBuild) {
+            Map<Integer, Integer> foundBuildByIdx = query(connection -> {
+                boolean postgres = isPostgres(connection);
+                // See computeFailedSinceRun for why this predicate is only needed on PostgreSQL.
+                String identityHashPredicate = postgres
+                        ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
+                        : "";
+                StringBuilder sql = new StringBuilder();
+                for (int i = 0; i < chunk.size(); i++) {
+                    if (i > 0) {
+                        sql.append(" UNION ALL ");
+                    }
+                    sql.append("SELECT ").append(i).append(" AS idx, (SELECT MAX(build) FROM caseResults ")
+                            .append("WHERE job = ? AND build >= ? AND build < ? AND suite = ? AND package = ? ")
+                            .append("AND classname = ? AND testname = ? ")
+                            .append(identityHashPredicate)
+                            .append(") AS foundbuild");
+                }
+                Map<Integer, Integer> result = new HashMap<>();
+                var spanBatch = createSpan("previousCaseResultBatch");
+                addSqlAttribute(spanBatch, sql.toString());
+                spanBatch.setAttribute("batchSize", chunk.size());
+                try (PreparedStatement statement = connection.prepareStatement(sql.toString());
+                     Scope ignore = spanBatch.makeCurrent()) {
+                    int paramIndex = 1;
+                    for (CaseResult caseResult : chunk) {
+                        paramIndex = bindPreviousCaseResultParams(
+                                caseResult, minCandidateBuild, build, statement, paramIndex, postgres);
+                    }
+                    try (ResultSet resultSet = statement.executeQuery()) {
+                        while (resultSet.next()) {
+                            int found = resultSet.getInt("foundbuild");
+                            if (!resultSet.wasNull()) {
+                                result.put(resultSet.getInt("idx"), found);
+                            }
+                        }
+                    }
+                } finally {
+                    spanBatch.end();
+                }
+                return result;
+            });
+
+            for (int i = 0; i < chunk.size(); i++) {
+                Integer foundBuild = foundBuildByIdx.get(i);
+                if (foundBuild == null) {
+                    continue;
+                }
+                CaseResult caseResult = chunk.get(i);
+                CaseResult previous = materializePreviousCaseResult(foundBuild, caseResult);
+                if (previous != null) {
+                    entry.previousCaseResultByTest.put(previousCaseResultCacheKey(caseResult), previous);
+                }
+            }
+        }
+
+        private int bindPreviousCaseResultParams(CaseResult caseResult, int minBuildInclusive, int maxBuildExclusive,
+                PreparedStatement preparedStatement, int paramIndex, boolean postgres) throws SQLException {
+            preparedStatement.setString(paramIndex++, job);
+            preparedStatement.setInt(paramIndex++, minBuildInclusive);
+            preparedStatement.setInt(paramIndex++, maxBuildExclusive);
+            preparedStatement.setString(paramIndex++, caseResult.getSuiteResult().getName());
+            preparedStatement.setString(paramIndex++, caseResult.getPackageName());
+            preparedStatement.setString(paramIndex++, caseResult.getClassName());
+            preparedStatement.setString(paramIndex++, caseResult.getName());
+            if (postgres) {
+                preparedStatement.setString(paramIndex++, job);
+                preparedStatement.setString(paramIndex++, caseResult.getClassName());
+                preparedStatement.setString(paramIndex++, caseResult.getName());
+            }
+            return paramIndex;
+        }
+
+        /**
+         * Builds the actual {@link CaseResult} for a historical build already known (via
+         * {@link #computePreviousCaseResultBatchChunk}) to contain a matching case, by loading just
+         * that one suite (memoized per build/suite the same way {@link #getSuite(String)} always is,
+         * so repeated calls for the same historical build+suite across many cases of the current
+         * build only load it once) and looking the specific case up by its transformed display name,
+         * exactly as the default {@code CaseResult#getPreviousResult()} walk would have.
+         */
+        private CaseResult materializePreviousCaseResult(int foundBuild, CaseResult caseResult) {
+            SuiteResult suite =
+                    new TestResultStorage(job, foundBuild).getSuite(caseResult.getSuiteResult().getName());
+            return suite == null ? null : suite.getCase(caseResult.getTransformedFullDisplayName());
         }
 
         private Run<?, ?> computeFailedSinceRun(Span span, CaseResult caseResult) {
@@ -981,7 +1432,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     try (ResultSet result = statement.executeQuery()) {
                         boolean hasPassed = result.next();
                         if (!hasPassed) {
-                            return theJob.getBuildByNumber(1);
+                            // Never passed (in the data retained so far): failed since the earliest
+                            // build that actually contains this test identity, not build #1 -- the
+                            // test may have been introduced, e.g., in build #100, in which case that
+                            // is the correct "failed since" build, matching what the build-by-build
+                            // walk in CaseResult.getPreviousResult() would have found.
+                            return theJob.getBuildByNumber(earliestBuildForIdentity(connection, caseResult, postgres));
                         }
                         lastPassingBuildNumber = result.getInt("build");
                     }
@@ -1028,6 +1484,49 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 preparedStatement.setString(7, job);
                 preparedStatement.setString(8, caseResult.getClassName());
                 preparedStatement.setString(9, caseResult.getName());
+            }
+        }
+
+        /**
+         * Finds the earliest build that contains this exact test identity (any status), for a test
+         * that has no earlier passing build recorded. Since it never passed, that earliest occurrence
+         * is itself the first failing build -- including when the test was introduced partway through
+         * the job's history (e.g. first appearing, already failing, in build #100), rather than
+         * unconditionally blaming build #1 as if the test had always existed.
+         */
+        private int earliestBuildForIdentity(Connection connection, CaseResult caseResult, boolean postgres)
+                throws SQLException {
+            String identityHashPredicate = postgres
+                    ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
+                    : "";
+            String sql = "SELECT MIN(build) AS build FROM caseResults " +
+                    "WHERE job = ? AND suite = ? AND package = ? AND classname = ? AND testname = ? " +
+                    identityHashPredicate;
+            var span = createSpan("earliestBuildForIdentity");
+            addSqlAttribute(span, sql);
+            try (PreparedStatement statement = connection.prepareStatement(sql);
+                 Scope ignore = span.makeCurrent()) {
+                int paramIndex = 1;
+                statement.setString(paramIndex++, job);
+                statement.setString(paramIndex++, caseResult.getSuiteResult().getName());
+                statement.setString(paramIndex++, caseResult.getPackageName());
+                statement.setString(paramIndex++, caseResult.getClassName());
+                statement.setString(paramIndex++, caseResult.getName());
+                if (postgres) {
+                    statement.setString(paramIndex++, job);
+                    statement.setString(paramIndex++, caseResult.getClassName());
+                    statement.setString(paramIndex++, caseResult.getName());
+                }
+                try (ResultSet result = statement.executeQuery()) {
+                    result.next();
+                    int earliest = result.getInt("build");
+                    // MIN(build) should never be null here -- this build itself always matches its own
+                    // identity -- but fall back to the current build rather than propagating a bogus 0
+                    // if that invariant is ever violated (e.g. unexpected concurrent data changes).
+                    return result.wasNull() ? build : earliest;
+                }
+            } finally {
+                span.end();
             }
         }
 
@@ -1294,6 +1793,30 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          * generation, instead of repeating them on every render of the same build's page.
          */
         private final Map<String, Run<?, ?>> failedSinceRunByTest = new ConcurrentHashMap<>();
+
+        /**
+         * Guards {@code computeFailedSinceBatch}: set once the batched "failed since" computation has
+         * been attempted for this build (successfully or not), so it runs at most once per cache
+         * generation rather than once per failing case.
+         */
+        private volatile boolean failedSinceBatchComputed = false;
+        private final Object failedSinceBatchLock = new Object();
+
+        /**
+         * Memoizes {@link TestResultStorage#getPreviousCaseResult(CaseResult)} results per test
+         * identity within this build, analogous to {@link #failedSinceRunByTest}. Absence after
+         * {@link #previousCaseResultBatchComputed} is set means "determined there is no previous
+         * result", not "not yet computed".
+         */
+        private final Map<String, CaseResult> previousCaseResultByTest = new ConcurrentHashMap<>();
+
+        /**
+         * Guards {@code computePreviousCaseResultBatch}: set once the batched "previous case result"
+         * computation has been attempted for this build, so it runs at most once per cache generation
+         * rather than once per case.
+         */
+        private volatile boolean previousCaseResultBatchComputed = false;
+        private final Object previousCaseResultBatchLock = new Object();
 
         /** Cache weight (approximately the case count); 1 until the case list is actually loaded. */
         private volatile int weight = 1;
