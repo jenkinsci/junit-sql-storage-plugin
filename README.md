@@ -155,7 +155,9 @@ multi-row `INSERT`, significantly reducing publish time and server-side overhead
 the JDBC URL/connection properties in the `database`/`database-mysql`/`database-postgresql` plugin's
 configuration (Manage Jenkins → Configure System → Global Database):
 
-* MySQL: append `rewriteBatchedStatements=true` to the JDBC URL.
+* MySQL: append `rewriteBatchedStatements=true` to the JDBC URL. Agents, which do the publishing, enable it
+  on their own connections unless the configuration sets `rewriteBatchedStatements` explicitly (to keep it
+  off there, set `rewriteBatchedStatements=false`).
 * PostgreSQL: append `reWriteBatchedInserts=true` to the JDBC URL (enabled by default since pgjdbc 42.x
   in some distributions, but safe to set explicitly).
 
@@ -173,6 +175,18 @@ per-build test case counts), be aware that:
   even on large tables.
   PostgreSQL also gains the primary key (for row identity/future maintenance tooling), but remains a heap
   table — it does not get the same automatic physical-clustering read speedup MySQL does.
+
+### Database connections from agents
+
+Agents write test results straight to the database. An agent only does this a few times per build, so its
+connection pool keeps no idle connections: each connection is closed as soon as the publish is done. This
+matters with many short-lived agents (cloud or spot/preemptible machines): an agent that disappears without
+closing its sockets would otherwise leave its idle connections open on the database until the server's idle
+timeout, and enough of them exhaust the database's connection limit for every other client.
+
+To keep idle connections on agents anyway, start the agent JVM with
+`-Dio.jenkins.plugins.junit.storage.database.DatabaseTestResultStorage.agentMaxIdle=<n>`. The pool on the
+controller is not affected.
 
 ## Contributing
 

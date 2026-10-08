@@ -43,10 +43,14 @@ import hudson.util.Secret;
 import hudson.util.StreamTaskListener;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageConfiguration;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
+import javax.sql.DataSource;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.pool2.impl.GenericObjectPool;
 import org.apache.tools.ant.DirectoryScanner;
+import org.jenkinsci.plugins.database.BasicDataSource2;
 import org.jenkinsci.plugins.database.GlobalDatabaseConfiguration;
+import org.jenkinsci.plugins.database.mysql.MySQLDatabase;
 import org.jenkinsci.plugins.database.postgresql.PostgreSQLDatabase;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
@@ -1374,6 +1378,99 @@ class DatabaseTestResultStorageTest {
         }
 
         return caseResults;
+    }
+
+    @Test
+    void agentPoolClosesConnectionsInsteadOfKeepingThemIdle() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            postgres.start();
+            // Built the same way Database#getDataSource() builds it.
+            BasicDataSource2 factory = new BasicDataSource2();
+            factory.setDriverClassName(postgres.getDriverClassName());
+            factory.setUrl(postgres.getJdbcUrl());
+            factory.setUsername(postgres.getUsername());
+            factory.setPassword(postgres.getPassword());
+            DataSource dataSource = factory.createDataSource();
+            try {
+                var pool = (GenericObjectPool<?>) DatabaseTestResultStorage.RemoteConnectionSupplier.poolOf(dataSource);
+                assertNotNull(pool);
+                try (Connection connection = dataSource.getConnection()) {
+                    assertTrue(connection.isValid(5));
+                }
+                assertThat(pool.getNumIdle(), is(1));
+
+                DatabaseTestResultStorage.RemoteConnectionSupplier.limitIdleConnections(dataSource);
+                assertThat(pool.getMaxIdle(), is(0));
+                // The connection that was already idle is closed too.
+                assertThat(pool.getNumIdle(), is(0));
+
+                try (Connection connection = dataSource.getConnection()) {
+                    assertTrue(connection.isValid(5));
+                    assertThat(pool.getNumActive(), is(1));
+                }
+                // Returned to the pool and closed right away: nothing stays open on the database.
+                assertThat(pool.getNumActive(), is(0));
+                assertThat(pool.getNumIdle(), is(0));
+            } finally {
+                factory.close();
+            }
+        }
+    }
+
+    @Test
+    void agentMySqlConfigurationGetsBatchRewrite() throws Exception {
+        var database = new MySQLDatabase("db.example:3306", "jenkins", "user", Secret.fromString("secret"), null);
+        database.setValidationQuery("SELECT 1");
+
+        var copy = (MySQLDatabase) DatabaseTestResultStorage.RemoteDatabaseCache.withMySqlBatchRewrite(database);
+
+        assertNotSame(database, copy);
+        assertEquals("true", Util.loadProperties(copy.properties).getProperty("rewriteBatchedStatements"));
+        assertEquals(database.hostname, copy.hostname);
+        assertEquals(database.database, copy.database);
+        assertEquals(database.username, copy.username);
+        assertEquals("secret", Secret.toString(copy.password));
+        assertEquals("SELECT 1", copy.getValidationQuery());
+    }
+
+    @Test
+    void agentMySqlConfigurationKeepsOtherProperties() throws Exception {
+        var database = new MySQLDatabase("db.example", "jenkins", "user", Secret.fromString("secret"), "useSSL=false");
+
+        var copy = (MySQLDatabase) DatabaseTestResultStorage.RemoteDatabaseCache.withMySqlBatchRewrite(database);
+
+        var properties = Util.loadProperties(copy.properties);
+        assertEquals("false", properties.getProperty("useSSL"));
+        assertEquals("true", properties.getProperty("rewriteBatchedStatements"));
+    }
+
+    @Test
+    void agentDatabaseConfigurationWithExplicitBatchRewriteOrNotMySqlIsUnchanged() {
+        var explicit = new MySQLDatabase("db.example", "jenkins", "user", Secret.fromString("secret"),
+                "rewriteBatchedStatements=false");
+        assertSame(explicit, DatabaseTestResultStorage.RemoteDatabaseCache.withMySqlBatchRewrite(explicit));
+
+        var postgres = new PostgreSQLDatabase("db.example", "jenkins", "user", Secret.fromString("secret"), null);
+        assertSame(postgres, DatabaseTestResultStorage.RemoteDatabaseCache.withMySqlBatchRewrite(postgres));
+    }
+
+    @Test
+    void remoteSupplierOnControllerKeepsTheSharedPoolIdleConnections() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+            var controllerPool = (GenericObjectPool<?>) DatabaseTestResultStorage.RemoteConnectionSupplier.poolOf(
+                    requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource());
+            assertNotNull(controllerPool);
+            int maxIdle = controllerPool.getMaxIdle();
+
+            // A build on the built-in node publishes through RemoteConnectionSupplier on the controller.
+            try (Connection connection = new DatabaseTestResultStorage.RemoteConnectionSupplier().connection()) {
+                assertTrue(connection.isValid(5));
+            }
+
+            assertThat(controllerPool.getMaxIdle(), is(maxIdle));
+            assertTrue(controllerPool.getNumIdle() > 0, "controller pool must keep the returned connection idle");
+        }
     }
 
     private void setupPlugin(PostgreSQLContainer<?> postgres) {
