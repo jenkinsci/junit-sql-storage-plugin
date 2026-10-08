@@ -56,6 +56,7 @@ import io.opentelemetry.context.Scope;
 import jenkins.model.Jenkins;
 import jenkins.security.SlaveToMasterCallable;
 import jenkins.util.SystemProperties;
+import net.sf.json.JSONObject;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.database.Database;
@@ -79,6 +80,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int MAX_STACK_TRACE_LENGTH = 100000;
     static final int MAX_ERROR_DETAILS_LENGTH = 100000;
     static final int MAX_SKIPPED_LENGTH = 1000;
+    static final int MAX_PROPERTIES_LENGTH = 100000;
     /** The maximum size of a batch to store to the database, used when publishing */
     static final int MAX_DB_BATCH_SIZE = 2000;
 
@@ -355,7 +357,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             var publishSpan = createSpan("DatabaseTestResultStorage.RemotePublisherImpl.publish");
             var sql = "INSERT INTO caseResults (job, "
                     + "build, suite, package, className, testName, errorDetails, skipped, duration, stdout, "
-                    + "stderr, stacktrace) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    + "stderr, stacktrace, properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
             try (Connection connection = connectionSupplier.connection();
                     PreparedStatement statement = connection.prepareStatement(sql);
                     Scope ignore = publishSpan.makeCurrent()) {
@@ -455,6 +457,12 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 StringUtils.truncate(caseResult.getErrorStackTrace(), MAX_STACK_TRACE_LENGTH));
                     } else {
                         statement.setNull(12, Types.VARCHAR);
+                    }
+                    String properties = serializeProperties(caseResult.getProperties());
+                    if (properties != null) {
+                        statement.setString(13, properties);
+                    } else {
+                        statement.setNull(13, Types.VARCHAR);
                     }
                     statement.addBatch();
                     count++;
@@ -2059,7 +2067,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         private List<CaseResult> loadCaseResultsFromDB(Span parentSpan) {
             var sql = "SELECT suite, package, "
-                    + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
+                    + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace, properties "
                     + "FROM caseResults WHERE job = ? AND build = ?";
             return loadCaseResultRows("DatabaseTestResultStorage.TestResultStorage.loadCaseResultsFromDB", sql,
                     statement -> {
@@ -2075,7 +2083,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
          */
         private List<CaseResult> loadCasesForSuiteFromDB(Span parentSpan, String suiteName) {
             var sql = "SELECT suite, package, "
-                    + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace "
+                    + "testname, classname, errordetails, skipped, duration, stdout, stderr, stacktrace, properties "
                     + "FROM caseResults WHERE job = ? AND build = ? AND suite = ?";
             return loadCaseResultRows("DatabaseTestResultStorage.TestResultStorage.loadCasesForSuiteFromDB", sql,
                     statement -> {
@@ -2111,11 +2119,13 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                     String stderr = resultSet.getString("stderr");
                                     String stacktrace = resultSet.getString("stacktrace");
                                     float duration = resultSet.getFloat("duration");
+                                    Map<String, String> properties =
+                                            deserializeProperties(resultSet.getString("properties"));
                                     SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
                                     suiteResult.setParent(parent);
                                     CaseResult caseResult =
                                             new CaseResult(suiteResult, className, testName, errorDetails,
-                                                    skipped, duration, stdout, stderr, stacktrace);
+                                                    skipped, duration, stdout, stderr, stacktrace, properties);
                                     ClassResult classResult = classResults.get(className);
                                     if (classResult == null) {
                                         classResult =
@@ -2266,5 +2276,53 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      */
     private static boolean isPostgres(Connection connection) throws SQLException {
         return "PostgreSQL".equals(connection.getMetaData().getDatabaseProductName());
+    }
+
+    /**
+     * Serializes {@link CaseResult#getProperties()} (see JUnitParser's {@code keepProperties}
+     * option, <a href="https://github.com/jenkinsci/junit-plugin/pull/546">junit-plugin#546</a>) to
+     * a JSON object string for storage in the {@code properties} column, or {@code null} if there
+     * are no properties to store or the serialized form would not fit the column -- in the latter
+     * case properties are dropped rather than writing truncated, unparseable JSON.
+     */
+    @CheckForNull
+    static String serializeProperties(Map<String, String> properties) {
+        if (properties == null || properties.isEmpty()) {
+            return null;
+        }
+        String json = JSONObject.fromObject(properties).toString();
+        if (json.length() > MAX_PROPERTIES_LENGTH) {
+            log.warning(() -> "Dropping test case properties exceeding " + MAX_PROPERTIES_LENGTH
+                    + " characters when serialized");
+            return null;
+        }
+        return json;
+    }
+
+    /**
+     * Inverse of {@link #serializeProperties(Map)}. Returns an empty map for a {@code null}/blank
+     * column value, and falls back to an empty map (with a logged warning) if the stored JSON
+     * cannot be parsed, rather than propagating the failure up into the whole test report load.
+     */
+    @NonNull
+    static Map<String, String> deserializeProperties(String json) {
+        if (StringUtils.isBlank(json)) {
+            return Collections.emptyMap();
+        }
+        try {
+            Map<String, String> properties = new HashMap<>();
+            JSONObject jsonObject = JSONObject.fromObject(json);
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) jsonObject).entrySet()) {
+                Object value = entry.getValue();
+                properties.put(String.valueOf(entry.getKey()), value == null ? null : String.valueOf(value));
+            }
+            return properties;
+        } catch (RuntimeException x) {
+            // Deliberately not logging the raw JSON: properties are arbitrary build-provided data
+            // that may contain credentials or environment data, and a malformed value could also be
+            // used to inject bogus multiline log entries. The exception is diagnostic enough.
+            log.log(Level.WARNING, x, () -> "Failed to parse stored test case properties");
+            return Collections.emptyMap();
+        }
     }
 }

@@ -78,6 +78,7 @@ import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.equalToIgnoringCase;
+import static org.hamcrest.Matchers.hasEntry;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasProperty;
 import static org.hamcrest.Matchers.hasSize;
@@ -260,6 +261,68 @@ class DatabaseTestResultStorageTest {
             assertThat(supersweetSuite.getCases(), hasSize(1));
             assertThat(supersweetSuite.getCases().get(0).getName(), equalTo("test1"));
             assertThat(supersweetSuite.getCases().get(0).getClassName(), equalTo("another.Klazz"));
+        }
+    }
+
+    /**
+     * Verifies that test case properties (see JUnitParser's {@code keepProperties} option,
+     * <a href="https://github.com/jenkinsci/junit-plugin/pull/546">junit-plugin#546</a>, added for
+     * <a href="https://github.com/jenkinsci/junit-sql-storage-plugin/issues/425">#425</a>) survive a
+     * round trip through the SQL storage backend: published with {@code keepProperties: true}, read
+     * back via both {@link TestResultAction#getFailedTests()} (a full build load) and
+     * {@link TestResultImpl#getSuite(String)} (a suite-scoped load).
+     */
+    @Test
+    void properties() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            jenkinsRule.createOnlineSlave(Label.get("remote"));
+            var workflowJob = jenkinsRule.createProject(WorkflowJob.class, "properties-test");
+            workflowJob.setDefinition(new CpsFlowDefinition(
+                    """
+                    node('remote') {
+                        writeFile file: 'x.xml', text: '''<testsuite name='sweet'>
+                            <testcase classname='Klazz' name='test1'>
+                                <properties>
+                                    <property name='owner' value='team-a'/>
+                                </properties>
+                                <error message='failure'/>
+                            </testcase>
+                            <testcase classname='Klazz' name='test2'/>
+                        </testsuite>'''
+                        junit testResults: 'x.xml', keepProperties: true
+                    }
+                    """,
+                    true));
+            var workflowRun = Objects.requireNonNull(workflowJob.scheduleBuild2(0)).get();
+            jenkinsRule.waitForCompletion(workflowRun);
+            jenkinsRule.assertBuildStatus(Result.UNSTABLE, workflowRun);
+
+            TestResultAction testResultAction = workflowRun.getAction(TestResultAction.class);
+            assertNotNull(testResultAction);
+
+            CaseResult failedTest = testResultAction.getFailedTests().get(0);
+            assertEquals("test1", failedTest.getName());
+            assertThat(failedTest.getProperties(), hasEntry("owner", "team-a"));
+
+            CaseResult passedTest = testResultAction.getPassedTests().get(0);
+            assertEquals("test2", passedTest.getName());
+            assertThat(passedTest.getProperties().entrySet(), hasSize(0));
+
+            // Invalidate the cache populated by getFailedTests() above, so getSuite() below actually
+            // exercises the suite-scoped loadCasesForSuiteFromDB() query rather than reusing the
+            // already-resident full case list.
+            DatabaseTestResultStorage.invalidate(workflowJob.getFullName(), workflowRun.getNumber());
+
+            TestResultImpl pluggableStorage =
+                    requireNonNull(testResultAction.getResult().getPluggableStorage());
+            SuiteResult suiteResult = pluggableStorage.getSuite("sweet");
+            CaseResult test1ViaSuite = suiteResult.getCases().stream()
+                    .filter(caseResult -> caseResult.getName().equals("test1"))
+                    .findFirst()
+                    .orElseThrow();
+            assertThat(test1ViaSuite.getProperties(), hasEntry("owner", "team-a"));
         }
     }
 
@@ -1202,6 +1265,7 @@ class DatabaseTestResultStorageTest {
         mapOfColumnTypes.put("stdout", "VARCHAR");
         mapOfColumnTypes.put("stderr", "VARCHAR");
         mapOfColumnTypes.put("stacktrace", "VARCHAR");
+        mapOfColumnTypes.put("properties", "VARCHAR");
         mapOfColumnTypes.put("timestamp", "TIMESTAMP");
         mapOfColumnTypes.put("testidentityhash", "VARCHAR");
         return mapOfColumnTypes;
@@ -1313,6 +1377,15 @@ class DatabaseTestResultStorageTest {
                 return caseResults.get(index).getErrorStackTrace();
             } else {
                 throw getMockException(index, "stacktrace");
+            }
+        });
+        var propertiesCounter = new AtomicInteger(0);
+        Mockito.when(resultSet.getString("properties")).thenAnswer(invocation -> {
+            int index = propertiesCounter.getAndIncrement();
+            if (index < caseResults.size()) {
+                return DatabaseTestResultStorage.serializeProperties(caseResults.get(index).getProperties());
+            } else {
+                throw getMockException(index, "properties");
             }
         });
         var durationCounter = new AtomicInteger(0);
