@@ -2130,7 +2130,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 classResults.values().forEach(ClassResult::tally);
                             }
                         }
-                        log.info(String.format("Loaded %d test cases from database for '%s #%d'.", results.size(), job,
+                        log.fine(String.format("Loaded %d test cases from database for '%s #%d'.", results.size(), job,
                                 build));
                         return results;
                     }));
