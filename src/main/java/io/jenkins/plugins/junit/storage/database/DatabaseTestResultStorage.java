@@ -1310,7 +1310,9 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             withSpan("DatabaseTestResultStorage.TestResultStorage.forEachCaseResultSummary", span -> {
                 span.setAttribute("fromBuild", fromBuild);
                 span.setAttribute("toBuild", toBuild);
-                var sql = "SELECT build, suite, classname, testname, errordetails IS NOT NULL AS failed, "
+                // a case fails when either errordetails or stacktrace is set, matching CaseResult#isPassed
+                var sql = "SELECT build, suite, classname, testname, "
+                        + "(errordetails IS NOT NULL OR stacktrace IS NOT NULL) AS failed, "
                         + "skipped IS NOT NULL AS isskipped, duration "
                         + "FROM caseResults WHERE job = ? AND build >= ? AND build <= ? ORDER BY build, id";
                 addSqlAttribute(span, sql);

@@ -55,6 +55,7 @@ final class CaseResultSummaryTestSupport {
                         + "<testcase classname='org.example.ATest' name='fails' time='0.25'><failure message='x'/></testcase>"
                         + "<testcase classname='org.example.ATest' name='skipped' time='0'><skipped/></testcase>"
                         + "<testcase classname='RootTest' name='errors' time='1'><error message='y'/></testcase>"
+                        + "<testcase classname='RootTest' name='traceOnly' time='1'><failure>at Foo.bar</failure></testcase>"
                         + "</testsuite>"), listener);
         storage.createRemotePublisher(build2).publish(testResult(
                 "<testsuite name='s1'>"
@@ -82,11 +83,15 @@ final class CaseResultSummaryTestSupport {
                 .map(s -> describe(s.getBuild(), s.getSuiteName(), s.getClassName(), s.getPackageName(),
                         s.getSimpleName(), s.getName(), s.isFailed(), s.isSkipped(), s.getDuration()))
                 .toList();
-        assertEquals(7, actual.size(), actual::toString);
+        assertEquals(8, actual.size(), actual::toString);
         assertThat(actual, containsInAnyOrder(expected.toArray(new String[0])));
+        // a failure without a message only has a stack trace, but still counts as failed
+        assertTrue(summaries.stream()
+                .filter(s -> s.getName().equals("traceOnly"))
+                .allMatch(CaseResultSummary::isFailed));
         // grouped by build, ascending
         assertThat(summaries.stream().map(CaseResultSummary::getBuild).distinct().toList(), contains(1, 2));
-        assertTrue(summaries.subList(0, 4).stream().allMatch(s -> s.getBuild() == 1));
+        assertTrue(summaries.subList(0, 5).stream().allMatch(s -> s.getBuild() == 1));
 
         List<String> onlyBuild2 = new ArrayList<>();
         impl.forEachCaseResultSummary(2, 2, s -> onlyBuild2.add(s.getBuild() + ":" + s.getName()));
