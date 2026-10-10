@@ -18,6 +18,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -46,6 +47,7 @@ import hudson.tasks.junit.TestResultSummary;
 import hudson.tasks.junit.TrendTestResultSummary;
 import hudson.tasks.test.AbstractTestResultAction;
 import hudson.util.Secret;
+import io.jenkins.plugins.junit.storage.CaseResultSummary;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorage;
 import io.jenkins.plugins.junit.storage.JunitTestResultStorageDescriptor;
 import io.jenkins.plugins.junit.storage.TestResultImpl;
@@ -83,6 +85,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int MAX_PROPERTIES_LENGTH = 100000;
     /** The maximum size of a batch to store to the database, used when publishing */
     static final int MAX_DB_BATCH_SIZE = 2000;
+    /** Rows fetched per round trip when streaming {@link TestResultStorage#forEachCaseResultSummary} on PostgreSQL */
+    static final int CASE_RESULT_SUMMARY_FETCH_SIZE = 5000;
 
     /**
      * Number of failing {@link CaseResult}s whose "failed since" build is looked up in a single SQL
@@ -1287,6 +1291,67 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 preparedStatement.setString(paramIndex++, caseResult.getName());
             }
             return paramIndex;
+        }
+
+        @Override
+        public boolean supportsCaseResultSummaries() {
+            return true;
+        }
+
+        /**
+         * Streams the identity and status of every case in a range of builds with a single query over the
+         * {@code (job, build, id)} primary key, without the stdout/stderr/stacktrace/properties columns a
+         * full build load reads and without hydrating {@link CaseResult}s, so a consumer that needs a
+         * per-test matrix across many builds (e.g. the Test Results Analyzer) doesn't have to load every
+         * build's full result.
+         */
+        @Override
+        public void forEachCaseResultSummary(int fromBuild, int toBuild, Consumer<CaseResultSummary> consumer) {
+            withSpan("DatabaseTestResultStorage.TestResultStorage.forEachCaseResultSummary", span -> {
+                span.setAttribute("fromBuild", fromBuild);
+                span.setAttribute("toBuild", toBuild);
+                var sql = "SELECT build, suite, classname, testname, errordetails IS NOT NULL AS failed, "
+                        + "skipped IS NOT NULL AS isskipped, duration "
+                        + "FROM caseResults WHERE job = ? AND build >= ? AND build <= ? ORDER BY build, id";
+                addSqlAttribute(span, sql);
+                return query(connection -> {
+                    boolean postgres = isPostgres(connection);
+                    boolean autoCommit = connection.getAutoCommit();
+                    // PostgreSQL only honours the fetch size (rather than buffering the whole result set)
+                    // inside a transaction; MySQL streams row by row with a fetch size of Integer.MIN_VALUE.
+                    if (postgres && autoCommit) {
+                        connection.setAutoCommit(false);
+                    }
+                    int rows = 0;
+                    try (PreparedStatement statement = connection.prepareStatement(sql,
+                            ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
+                        statement.setFetchSize(postgres ? CASE_RESULT_SUMMARY_FETCH_SIZE : Integer.MIN_VALUE);
+                        statement.setString(1, job);
+                        statement.setInt(2, fromBuild);
+                        statement.setInt(3, toBuild);
+                        try (ResultSet resultSet = statement.executeQuery()) {
+                            while (resultSet.next()) {
+                                consumer.accept(new CaseResultSummary(
+                                        resultSet.getInt(1),
+                                        resultSet.getString(2),
+                                        resultSet.getString(3),
+                                        resultSet.getString(4),
+                                        resultSet.getBoolean(5),
+                                        resultSet.getBoolean(6),
+                                        resultSet.getFloat(7)));
+                                rows++;
+                            }
+                        }
+                    } finally {
+                        if (postgres && autoCommit) {
+                            connection.rollback();
+                            connection.setAutoCommit(true);
+                        }
+                    }
+                    span.setAttribute("rows", rows);
+                    return null;
+                });
+            });
         }
 
         @Override

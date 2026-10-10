@@ -57,7 +57,7 @@
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
             <artifactId>junit</artifactId>
-            <version>1436.v04461a_d56ca_f</version>
+            <version>999999-SNAPSHOT</version>
         </dependency>
         <dependency>
             <groupId>io.jenkins.plugins</groupId>

@@ -60,6 +60,16 @@ class DatabaseMySqlTestResultStorageTest {
     }
 
     @Test
+    void forEachCaseResultSummary_matchesFullLoad() throws Exception {
+        try (MySQLContainer<?> mysql = new MySQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(mysql);
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+            CaseResultSummaryTestSupport.assertSummariesMatchFullLoad(jenkinsRule, storage);
+        }
+    }
+
+    @Test
     void concurrentFirstPublish_bothSucceedWithConsistentSummary() throws Exception {
         // Given: two publishers racing to insert the very first caseResultsSummary row for the
         // same brand-new (job, build) -- the scenario that used to deadlock under MySQL's default
