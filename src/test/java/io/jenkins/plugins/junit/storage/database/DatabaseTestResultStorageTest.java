@@ -124,6 +124,16 @@ class DatabaseTestResultStorageTest {
     }
 
     @Test
+    void forEachCaseResultSummary_matchesFullLoad() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+            CaseResultSummaryTestSupport.assertSummariesMatchFullLoad(jenkinsRule, storage);
+        }
+    }
+
+    @Test
     void smokes() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
