@@ -60,6 +60,16 @@ class DatabaseMySqlTestResultStorageTest {
     }
 
     @Test
+    void getPreviousCaseResult_resolvesNearestBuildAcrossLargeBuilds() throws Exception {
+        try (MySQLContainer<?> mysql = new MySQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(mysql);
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+            PreviousCaseResultTestSupport.assertPreviousCaseResultsResolveToNearestBuild(jenkinsRule, storage);
+        }
+    }
+
+    @Test
     void forEachCaseResultSummary_matchesFullLoad() throws Exception {
         try (MySQLContainer<?> mysql = new MySQLContainer<>(TEST_IMAGE)) {
             setupPlugin(mysql);

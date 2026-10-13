@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -102,12 +103,22 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int FAILED_SINCE_BATCH_SIZE = 200;
 
     /**
-     * Same rationale and shape as {@link #FAILED_SINCE_BATCH_SIZE}, but for
-     * {@link TestResultImpl#getPreviousCaseResult(CaseResult)}: a test-report page calls
-     * {@link CaseResult#getPreviousResult()} once per case of the current build (not just failing
-     * ones), so batching matters even more here.
+     * Same rationale and shape as {@link #FAILED_SINCE_BATCH_SIZE}, but for the cases that
+     * {@link TestResultImpl#getPreviousCaseResult(CaseResult)} could not resolve by loading whole
+     * historical builds (see {@link #PREVIOUS_CASE_RESULT_FULL_LOAD_THRESHOLD}).
      */
     static final int PREVIOUS_CASE_RESULT_BATCH_SIZE = 200;
+
+    /**
+     * A test-report page calls {@link CaseResult#getPreviousResult()} once per case of the current
+     * build (not just failing ones), so the previous results of every case are resolved up front by
+     * loading whole historical builds, newest first, and matching them in memory -- one query per
+     * build rather than one per {@link #PREVIOUS_CASE_RESULT_BATCH_SIZE} cases. Loading stops once at
+     * most this many cases remain unresolved, or a loaded build resolved at most this many, after
+     * which the remaining cases are looked up with batched identity-match queries instead, so that a
+     * handful of newly added tests do not force loading every candidate build in full.
+     */
+    static final int PREVIOUS_CASE_RESULT_FULL_LOAD_THRESHOLD = 2 * PREVIOUS_CASE_RESULT_BATCH_SIZE;
 
     /**
      * Mirrors {@code hudson.tasks.junit.CaseResult#PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX}: the
@@ -1407,39 +1418,73 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         /**
-         * Resolves "previous result" for every case of this build in a bounded number of round trips:
-         * one query to find the (at most {@link #PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX}) candidate
-         * historical builds, then one {@code UNION ALL}-based identity-match query per
-         * {@link #PREVIOUS_CASE_RESULT_BATCH_SIZE}-sized chunk of cases to find which of those builds
-         * (if any) contains a matching case for each -- instead of one suite load per historical build
-         * visited per case.
+         * Resolves "previous result" for every case of this build in a bounded number of round trips.
+         * One query finds the (at most {@link #PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX}) candidate
+         * historical builds. Then, newest first, whole candidate builds are loaded (through
+         * {@link #resultsCache}, so a later visit to that build's own page reuses them) and matched in
+         * memory, which typically resolves almost every case from the immediately preceding build in
+         * a single query. Once few enough cases remain unresolved (e.g. tests added since, which no
+         * candidate build contains), or a loaded build stopped resolving many of them, the remainder
+         * fall back to the {@code UNION ALL}-based identity-match query, one round trip per
+         * {@link #PREVIOUS_CASE_RESULT_BATCH_SIZE} cases, restricted to the builds not yet loaded.
+         * Matching every case through that query alone needed one round trip per 200 cases, which for
+         * builds with 100k+ cases took minutes per page render.
          */
         private void computePreviousCaseResultBatch(Span span, ResultsEntry entry) {
             List<CaseResult> cases = entry.getCaseResults(span);
             if (cases.isEmpty()) {
                 return;
             }
-            // Builds already present in caseResults are exactly the builds that published results, so
-            // the lowest of the most recent PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX distinct builds
-            // below this one, used as a numeric lower bound, covers precisely the same set of builds
-            // as an explicit IN-list would -- without needing to bind one parameter per candidate.
             List<Integer> candidateBuilds = getPreviousBuildNumbers(PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX);
             if (candidateBuilds.isEmpty()) {
                 return;
             }
-            int minCandidateBuild = Collections.min(candidateBuilds);
-            for (int start = 0; start < cases.size(); start += PREVIOUS_CASE_RESULT_BATCH_SIZE) {
-                List<CaseResult> chunk = cases.subList(start,
-                        Math.min(start + PREVIOUS_CASE_RESULT_BATCH_SIZE, cases.size()));
-                computePreviousCaseResultBatchChunk(entry, chunk, minCandidateBuild);
+            Map<String, CaseResult> unresolved = new LinkedHashMap<>();
+            for (CaseResult caseResult : cases) {
+                unresolved.putIfAbsent(previousCaseResultCacheKey(caseResult), caseResult);
+            }
+            // candidateBuilds is newest first; builds before this index have been fully matched already
+            int nextCandidate = 0;
+            int lastResolved = Integer.MAX_VALUE;
+            while (nextCandidate < candidateBuilds.size()
+                    && unresolved.size() > PREVIOUS_CASE_RESULT_FULL_LOAD_THRESHOLD
+                    && lastResolved > PREVIOUS_CASE_RESULT_FULL_LOAD_THRESHOLD) {
+                int candidate = candidateBuilds.get(nextCandidate++);
+                int before = unresolved.size();
+                for (CaseResult previous : new TestResultStorage(job, candidate).getCaseResults()) {
+                    String key = previousCaseResultCacheKey(previous);
+                    if (unresolved.remove(key) != null) {
+                        entry.previousCaseResultByTest.put(key, previous);
+                    }
+                }
+                lastResolved = before - unresolved.size();
+            }
+            if (unresolved.isEmpty() || nextCandidate >= candidateBuilds.size()) {
+                return;
+            }
+            // Builds already present in caseResults are exactly the builds that published results, so
+            // the oldest candidate build and the oldest one already loaded, used as numeric bounds,
+            // cover precisely the remaining candidates -- without binding one parameter per candidate.
+            int minCandidateBuild = candidateBuilds.get(candidateBuilds.size() - 1);
+            int maxCandidateBuildExclusive = nextCandidate == 0 ? build : candidateBuilds.get(nextCandidate - 1);
+            List<CaseResult> remaining = new ArrayList<>(unresolved.values());
+            for (int start = 0; start < remaining.size(); start += PREVIOUS_CASE_RESULT_BATCH_SIZE) {
+                List<CaseResult> chunk = remaining.subList(start,
+                        Math.min(start + PREVIOUS_CASE_RESULT_BATCH_SIZE, remaining.size()));
+                computePreviousCaseResultBatchChunk(entry, chunk, minCandidateBuild, maxCandidateBuildExclusive);
             }
         }
 
-        /** The at most {@code limit} most recent distinct build numbers below this build in {@code caseResults}. */
+        /**
+         * The at most {@code limit} most recent build numbers below this build that published results,
+         * newest first. Read from {@code caseResultsSummary}, which has exactly one row per such build,
+         * rather than {@code SELECT DISTINCT build FROM caseResults}, which has to step over every case
+         * row of each of those builds.
+         */
         private List<Integer> getPreviousBuildNumbers(int limit) {
             return query(connection -> {
                 var sql =
-                        "SELECT DISTINCT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT ?";
+                        "SELECT build FROM caseResultsSummary WHERE job = ? AND build < ? ORDER BY build DESC LIMIT ?";
                 try (PreparedStatement statement = connection.prepareStatement(sql)) {
                     statement.setString(1, job);
                     statement.setInt(2, build);
@@ -1456,7 +1501,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         private void computePreviousCaseResultBatchChunk(ResultsEntry entry, List<CaseResult> chunk,
-                int minCandidateBuild) {
+                int minCandidateBuild, int maxCandidateBuildExclusive) {
             Map<Integer, Integer> foundBuildByIdx = query(connection -> {
                 boolean postgres = isPostgres(connection);
                 // See computeFailedSinceRun for why this predicate is only needed on PostgreSQL.
@@ -1483,7 +1528,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     int paramIndex = 1;
                     for (CaseResult caseResult : chunk) {
                         paramIndex = bindPreviousCaseResultParams(
-                                caseResult, minCandidateBuild, build, statement, paramIndex, postgres);
+                                caseResult, minCandidateBuild, maxCandidateBuildExclusive, statement, paramIndex,
+                                postgres);
                     }
                     try (ResultSet resultSet = statement.executeQuery()) {
                         while (resultSet.next()) {
@@ -1873,7 +1919,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      * most once per cache generation, regardless of how many {@link TestResultStorage} instances or
      * accessor calls request it (e.g. the several {@code getXCount()} calls JUnit makes per build).
      * A new generation is created by {@link #invalidate(String, int)}/{@link #invalidateJob(String)}
-     * evicting this entry from {@link #resultsCache}, or by the fixed one-minute expiry.
+     * evicting this entry from {@link #resultsCache}, or by its fixed expiry.
      */
     private final class ResultsEntry {
         private final CacheKey key;
@@ -1951,7 +1997,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         /**
          * Guards {@code computeFailedSinceBatch}: set once the batched "failed since" computation has
-         * been attempted for this build (successfully or not), so it runs at most once per cache
+         * completed successfully for this build, so it runs at most once per cache
          * generation rather than once per failing case.
          */
         private volatile boolean failedSinceBatchComputed = false;
