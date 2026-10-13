@@ -110,6 +110,31 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int PREVIOUS_CASE_RESULT_BATCH_SIZE = 200;
 
     /**
+     * While more than this many cases of a build are still without a previous result, the next
+     * candidate historical build may be loaded and matched in memory instead of querying them per
+     * {@link #PREVIOUS_CASE_RESULT_BATCH_SIZE} cases: this many cases already take ten identity-match
+     * round trips, each doing one index lookup per case. A candidate that is already loaded is
+     * matched in memory regardless.
+     */
+    static final int PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD = 10 * PREVIOUS_CASE_RESULT_BATCH_SIZE;
+
+    /**
+     * A candidate historical build is only loaded to be matched in memory if it has at most this many
+     * times as many cases as are still without a previous result. Loading costs per row of the
+     * candidate (with its stdout/stderr/stack trace), querying per unresolved case; on a large
+     * {@code caseResults} table one query-path case costs at least ten loaded rows.
+     */
+    static final int PREVIOUS_CASE_RESULT_MAX_LOAD_RATIO = 10;
+
+    /**
+     * How many candidate builds in a row may each resolve less than a tenth of the remaining cases
+     * before the in-memory walk gives up and leaves the rest to the identity-match query. Allows for a
+     * nearest build that ran only part of the tests, while bounding how many builds are loaded for
+     * tests that are new in this build.
+     */
+    static final int PREVIOUS_CASE_RESULT_MAX_UNPRODUCTIVE_BUILDS = 2;
+
+    /**
      * Mirrors {@code hudson.tasks.junit.CaseResult#PREVIOUS_TEST_RESULT_BACKTRACK_BUILDS_MAX}: the
      * number of historical builds {@link CaseResult#getPreviousResult()} is willing to consider when
      * looking for a case with the same identity. Read independently (same system property key) rather
@@ -1407,56 +1432,201 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         }
 
         /**
-         * Resolves "previous result" for every case of this build in a bounded number of round trips:
-         * one query to find the (at most {@link #PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX}) candidate
-         * historical builds, then one {@code UNION ALL}-based identity-match query per
-         * {@link #PREVIOUS_CASE_RESULT_BATCH_SIZE}-sized chunk of cases to find which of those builds
-         * (if any) contains a matching case for each -- instead of one suite load per historical build
-         * visited per case.
+         * Resolves "previous result" for every case of this build. Most cases also exist in the
+         * nearest earlier build with results, so candidate builds are matched in memory, newest first,
+         * by suite name and display name -- the same lookup {@link #materializePreviousCaseResult}
+         * does. A candidate is used this way if it is already loaded, or if it is worth loading (see
+         * {@link #PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD} and {@link #PREVIOUS_CASE_RESULT_MAX_LOAD_RATIO});
+         * the walk also stops after {@link #PREVIOUS_CASE_RESULT_MAX_UNPRODUCTIVE_BUILDS} builds in a
+         * row that resolve less than a tenth of the remaining cases. The rest go to the database: one
+         * {@code UNION ALL}-based identity-match query per {@link #PREVIOUS_CASE_RESULT_BATCH_SIZE}-sized
+         * chunk over the candidate builds older than the ones already walked.
+         *
+         * <p>Matching every case through those queries costs one round trip per 200 cases, each doing
+         * one index lookup per case; for builds with 100k+ cases that alone took minutes on a large
+         * {@code caseResults} table.
          */
         private void computePreviousCaseResultBatch(Span span, ResultsEntry entry) {
-            List<CaseResult> cases = entry.getCaseResults(span);
-            if (cases.isEmpty()) {
+            if (PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX <= 0) {
                 return;
             }
+            List<PendingCase> unresolved = new ArrayList<>();
+            for (CaseResult caseResult : entry.getCaseResults(span)) {
+                // The identity-match query never matches a NULL column, so such a case has no
+                // previous result; keep that behaviour rather than matching it in memory.
+                if (hasIdentity(caseResult)) {
+                    unresolved.add(new PendingCase(caseResult));
+                }
+            }
+            if (unresolved.isEmpty()) {
+                return;
+            }
+            // Candidate builds, newest first, discovered one at a time as they are needed.
+            List<Integer> candidateBuilds = new ArrayList<>();
+            int walked = 0;
+            int unproductive = 0;
+            while (!unresolved.isEmpty() && unproductive < PREVIOUS_CASE_RESULT_MAX_UNPRODUCTIVE_BUILDS) {
+                Integer candidateBuild = nextCandidateBuild(candidateBuilds);
+                if (candidateBuild == null) {
+                    break;
+                }
+                List<CaseResult> candidateCases = getCandidateCasesToMatch(span, candidateBuild, unresolved.size());
+                if (candidateCases == null) {
+                    break;
+                }
+                walked++;
+                Map<String, Map<String, CaseResult>> candidateCasesByName = new HashMap<>();
+                for (CaseResult candidateCase : candidateCases) {
+                    if (hasIdentity(candidateCase)) {
+                        // Later duplicates win, as in SuiteResult#getCase.
+                        candidateCasesByName.computeIfAbsent(candidateCase.getSuiteResult().getName(),
+                                        name -> new HashMap<>())
+                                .put(candidateCase.getTransformedFullDisplayName(), candidateCase);
+                    }
+                }
+                List<PendingCase> stillUnresolved = new ArrayList<>();
+                for (PendingCase pending : unresolved) {
+                    CaseResult previous = candidateCasesByName.getOrDefault(pending.suiteName, Map.of())
+                            .get(pending.displayName);
+                    if (previous != null) {
+                        entry.previousCaseResultByTest.put(previousCaseResultCacheKey(pending.caseResult), previous);
+                    } else {
+                        stillUnresolved.add(pending);
+                    }
+                }
+                int resolved = unresolved.size() - stillUnresolved.size();
+                int remaining = unresolved.size();
+                log.fine(() -> String.format("Matched %d of %d cases of '%s #%d' against #%d in memory.", resolved,
+                        remaining, job, build, candidateBuild));
+                unproductive = resolved * 10L < remaining ? unproductive + 1 : 0;
+                unresolved = stillUnresolved;
+            }
+            if (unresolved.isEmpty()) {
+                return;
+            }
+            // The oldest build of the whole backtrack window is the lower bound of the query.
+            Integer more;
+            do {
+                more = nextCandidateBuild(candidateBuilds);
+            } while (more != null);
+            if (walked == candidateBuilds.size()) {
+                return;
+            }
+            int unresolvedCount = unresolved.size();
+            log.fine(() -> String.format("Looking up previous results of %d cases of '%s #%d' by query.",
+                    unresolvedCount, job, build));
             // Builds already present in caseResults are exactly the builds that published results, so
             // the lowest of the most recent PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX distinct builds
             // below this one, used as a numeric lower bound, covers precisely the same set of builds
             // as an explicit IN-list would -- without needing to bind one parameter per candidate.
-            List<Integer> candidateBuilds = getPreviousBuildNumbers(PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX);
-            if (candidateBuilds.isEmpty()) {
-                return;
-            }
+            // Builds already matched in memory are excluded: the query only looks further back. It
+            // matches column values under the database collation (case-insensitive on MySQL by
+            // default) and then needs an exact display-name match in the build it found, so in rare
+            // cases it finds no previous result where an in-memory match of an older build would have.
             int minCandidateBuild = Collections.min(candidateBuilds);
-            for (int start = 0; start < cases.size(); start += PREVIOUS_CASE_RESULT_BATCH_SIZE) {
-                List<CaseResult> chunk = cases.subList(start,
-                        Math.min(start + PREVIOUS_CASE_RESULT_BATCH_SIZE, cases.size()));
-                computePreviousCaseResultBatchChunk(entry, chunk, minCandidateBuild);
+            int maxCandidateBuildExclusive = walked == 0 ? build : candidateBuilds.get(walked - 1);
+            List<CaseResult> chunkCases = new ArrayList<>(unresolvedCount);
+            unresolved.forEach(pending -> chunkCases.add(pending.caseResult));
+            for (int start = 0; start < chunkCases.size(); start += PREVIOUS_CASE_RESULT_BATCH_SIZE) {
+                List<CaseResult> chunk = chunkCases.subList(start,
+                        Math.min(start + PREVIOUS_CASE_RESULT_BATCH_SIZE, chunkCases.size()));
+                computePreviousCaseResultBatchChunk(entry, chunk, minCandidateBuild, maxCandidateBuildExclusive);
             }
         }
 
-        /** The at most {@code limit} most recent distinct build numbers below this build in {@code caseResults}. */
-        private List<Integer> getPreviousBuildNumbers(int limit) {
+        /** A case still without a previous result, with the lookup keys computed once. */
+        private record PendingCase(CaseResult caseResult, String suiteName, String displayName) {
+            PendingCase(CaseResult caseResult) {
+                this(caseResult, caseResult.getSuiteResult().getName(), caseResult.getTransformedFullDisplayName());
+            }
+        }
+
+        private boolean hasIdentity(CaseResult caseResult) {
+            // getPackageName() is derived from the class name, so it is never null once that is not, and
+            // getName() is never null ("(?)" for a missing test name).
+            return caseResult.getSuiteResult().getName() != null && caseResult.getClassName() != null;
+        }
+
+        /**
+         * The next older candidate build below those already in {@code candidateBuilds}, appended to it,
+         * or {@code null} once there is none or {@link #PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX} have
+         * been found. Each step is a single descending probe of the {@code (job, build, id)} primary key.
+         */
+        private Integer nextCandidateBuild(List<Integer> candidateBuilds) {
+            if (candidateBuilds.size() >= PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX) {
+                return null;
+            }
+            Integer next = getPreviousBuildNumber(
+                    candidateBuilds.isEmpty() ? build : candidateBuilds.get(candidateBuilds.size() - 1));
+            if (next != null) {
+                candidateBuilds.add(next);
+            }
+            return next;
+        }
+
+        /** The most recent build number below {@code before} in {@code caseResults}, or {@code null}. */
+        private Integer getPreviousBuildNumber(int before) {
             return query(connection -> {
-                var sql =
-                        "SELECT DISTINCT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT ?";
+                var sql = "SELECT build FROM caseResults WHERE job = ? AND build < ? ORDER BY build DESC LIMIT 1";
                 try (PreparedStatement statement = connection.prepareStatement(sql)) {
                     statement.setString(1, job);
-                    statement.setInt(2, build);
-                    statement.setInt(3, limit);
+                    statement.setInt(2, before);
                     try (ResultSet result = statement.executeQuery()) {
-                        List<Integer> builds = new ArrayList<>();
-                        while (result.next()) {
-                            builds.add(result.getInt("build"));
+                        return result.next() ? result.getInt("build") : null;
+                    }
+                }
+            });
+        }
+
+        /**
+         * The cases of {@code candidateBuild} to match {@code unresolvedCount} cases against in memory,
+         * or {@code null} if that is not worth it and they should be queried instead. A candidate whose
+         * cases are already loaded is always used. Otherwise it is loaded without going through
+         * {@code resultsCache}: two large builds may together exceed its weight budget, and evicting this
+         * build's own entry would discard the previous results being computed for it.
+         */
+        private List<CaseResult> getCandidateCasesToMatch(Span span, int candidateBuild, int unresolvedCount) {
+            CacheKey candidateKey = new CacheKey(job, candidateBuild);
+            ResultsEntry cached = resultsCache.getIfPresent(candidateKey);
+            List<CaseResult> resident = cached == null ? null : cached.caseResults;
+            if (resident != null) {
+                return resident;
+            }
+            if (unresolvedCount <= PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD
+                    || getCaseCount(candidateBuild) > (long) PREVIOUS_CASE_RESULT_MAX_LOAD_RATIO * unresolvedCount) {
+                return null;
+            }
+            return new ResultsEntry(candidateKey, job, candidateBuild).loadCaseResultsFromDB(span);
+        }
+
+        /** The number of cases of {@code countedBuild}, from its summary row if it has one. */
+        private long getCaseCount(int countedBuild) {
+            return query(connection -> {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "SELECT passCount + failCount + skipCount AS count FROM caseResultsSummary "
+                                + "WHERE job = ? AND build = ?")) {
+                    statement.setString(1, job);
+                    statement.setInt(2, countedBuild);
+                    try (ResultSet result = statement.executeQuery()) {
+                        if (result.next()) {
+                            return result.getLong("count");
                         }
-                        return builds;
+                    }
+                }
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "SELECT COUNT(*) AS count FROM caseResults WHERE job = ? AND build = ?")) {
+                    statement.setString(1, job);
+                    statement.setInt(2, countedBuild);
+                    try (ResultSet result = statement.executeQuery()) {
+                        result.next();
+                        return result.getLong("count");
                     }
                 }
             });
         }
 
         private void computePreviousCaseResultBatchChunk(ResultsEntry entry, List<CaseResult> chunk,
-                int minCandidateBuild) {
+                int minCandidateBuild, int maxCandidateBuildExclusive) {
             Map<Integer, Integer> foundBuildByIdx = query(connection -> {
                 boolean postgres = isPostgres(connection);
                 // See computeFailedSinceRun for why this predicate is only needed on PostgreSQL.
@@ -1483,7 +1653,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                     int paramIndex = 1;
                     for (CaseResult caseResult : chunk) {
                         paramIndex = bindPreviousCaseResultParams(
-                                caseResult, minCandidateBuild, build, statement, paramIndex, postgres);
+                                caseResult, minCandidateBuild, maxCandidateBuildExclusive, statement, paramIndex,
+                                postgres);
                     }
                     try (ResultSet resultSet = statement.executeQuery()) {
                         while (resultSet.next()) {
@@ -1967,8 +2138,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         /**
          * Guards {@code computePreviousCaseResultBatch}: set once the batched "previous case result"
-         * computation has been attempted for this build, so it runs at most once per cache generation
-         * rather than once per case.
+         * computation has completed for this build, so it runs at most once per cache generation rather
+         * than once per case. Not set if it fails, so the next lookup tries again.
          */
         private volatile boolean previousCaseResultBatchComputed = false;
         private final Object previousCaseResultBatchLock = new Object();

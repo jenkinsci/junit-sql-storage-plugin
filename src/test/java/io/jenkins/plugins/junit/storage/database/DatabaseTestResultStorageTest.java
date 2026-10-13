@@ -806,6 +806,421 @@ class DatabaseTestResultStorageTest {
     }
 
     @Test
+    void getPreviousCaseResult_queriesFewCasesWithoutLoadingCandidateBuilds() throws Exception {
+        // Given: two cases of the current build #3, one also present in the nearest build #2 and one
+        // only in the older build #1 -- well below PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD, so the
+        // identity-match query resolves both rather than loading any candidate build in full.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultFewCases");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build3 = jenkinsRule.buildAndAssertSuccess(p);
+
+            insertCases(p.getFullName(), new Object[][] {
+                {build1.getNumber(), "testInNearestBuild", 1.0f},
+                {build2.getNumber(), "testInNearestBuild", 2.0f},
+                {build3.getNumber(), "testInNearestBuild", 3.0f},
+                {build1.getNumber(), "testOnlyInOlderBuild", 1.5f},
+                {build3.getNumber(), "testOnlyInOlderBuild", 3.5f},
+            });
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build3.getNumber());
+
+            // When/Then: the case in the nearest build resolves to build #2, the other to build #1.
+            Optional<CaseResult> fromNearest =
+                    testResultStorage.getPreviousCaseResult(previousCaseLookup("testInNearestBuild"));
+            assertTrue(fromNearest.isPresent());
+            assertEquals(2.0f, fromNearest.get().getDuration(), 0.0001f);
+            Optional<CaseResult> fromOlder =
+                    testResultStorage.getPreviousCaseResult(previousCaseLookup("testOnlyInOlderBuild"));
+            assertTrue(fromOlder.isPresent());
+            assertEquals(1.5f, fromOlder.get().getDuration(), 0.0001f);
+
+            // Then: both went to the identity-match query, no candidate build was matched in memory.
+            assertEquals(0, countMessages(fine, " in memory."));
+            assertEquals(1, countMessages(fine, " by query."));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_walksOlderBuildsInMemoryWhenManyCasesAreMissingFromNearestBuild() throws Exception {
+        // Given: more than PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD cases of the current build #3
+        // missing from the nearest build #2 (e.g. it ran only part of the tests) but present in #1,
+        // so #1 is matched in memory too instead of querying every one of them.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultInMemoryWalk");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build3 = jenkinsRule.buildAndAssertSuccess(p);
+
+            int missingFromNearest = DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD + 1;
+            List<Object[]> rows = new ArrayList<>();
+            for (int i = 0; i < missingFromNearest; i++) {
+                rows.add(new Object[] {build1.getNumber(), "test" + i, 1.0f});
+                rows.add(new Object[] {build3.getNumber(), "test" + i, 3.0f});
+            }
+            rows.add(new Object[] {build2.getNumber(), "testOnlyInNearestBuild", 2.0f});
+            insertCases(p.getFullName(), rows.toArray(new Object[0][]));
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build3.getNumber());
+
+            // When/Then: every case resolves to build #1, the first and the last alike.
+            for (int i : new int[] {0, missingFromNearest - 1}) {
+                Optional<CaseResult> previous = testResultStorage.getPreviousCaseResult(previousCaseLookup("test" + i));
+                assertTrue(previous.isPresent());
+                assertEquals(1.0f, previous.get().getDuration(), 0.0001f);
+            }
+
+            // Then: builds #2 and #1 were matched in memory and nothing was left for the query.
+            assertEquals(
+                    1,
+                    countMessages(
+                            fine,
+                            "Matched 0 of " + missingFromNearest + " cases of '" + p.getFullName() + " #"
+                                    + build3.getNumber() + "' against #" + build2.getNumber() + " in memory."));
+            assertEquals(
+                    1,
+                    countMessages(
+                            fine,
+                            "Matched " + missingFromNearest + " of " + missingFromNearest
+                                    + " cases of '" + p.getFullName() + " #" + build3.getNumber() + "' against #"
+                                    + build1.getNumber()
+                                    + " in memory."));
+            assertEquals(0, countMessages(fine, " by query."));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_stopsWalkingForNewCasesAndQueriesOnlyOlderBuilds() throws Exception {
+        // Given: more than PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD cases new in the current build #4,
+        // plus one case only present in the oldest build #1. Builds #3 and #2 resolve none of them, so
+        // the walk stops after PREVIOUS_CASE_RESULT_MAX_UNPRODUCTIVE_BUILDS builds instead of loading
+        // every candidate build, and the query covers only the builds below the walked ones.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultNewCases");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build3 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build4 = jenkinsRule.buildAndAssertSuccess(p);
+
+            int newCases = DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD + 1;
+            List<Object[]> rows = new ArrayList<>();
+            for (int i = 0; i < newCases; i++) {
+                rows.add(new Object[] {build4.getNumber(), "newTest" + i, 4.0f});
+            }
+            rows.add(new Object[] {build1.getNumber(), "testOnlyInOldestBuild", 1.0f});
+            rows.add(new Object[] {build4.getNumber(), "testOnlyInOldestBuild", 4.0f});
+            for (WorkflowRun filler : List.of(build1, build2, build3)) {
+                rows.add(new Object[] {filler.getNumber(), "testNotInCurrentBuild", (float) filler.getNumber()});
+            }
+            insertCases(p.getFullName(), rows.toArray(new Object[0][]));
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build4.getNumber());
+
+            // When/Then: the case from build #1 is still found, new cases have no previous result.
+            Optional<CaseResult> fromOldest =
+                    testResultStorage.getPreviousCaseResult(previousCaseLookup("testOnlyInOldestBuild"));
+            assertTrue(fromOldest.isPresent());
+            assertEquals(1.0f, fromOldest.get().getDuration(), 0.0001f);
+            assertEquals(Optional.empty(), testResultStorage.getPreviousCaseResult(previousCaseLookup("newTest0")));
+
+            // Then: only builds #3 and #2 were loaded for the walk, the rest went to the query.
+            assertEquals(2, countMessages(fine, " in memory."));
+            assertEquals(0, countMessages(fine, "' against #" + build1.getNumber() + " in memory."));
+            assertEquals(
+                    1,
+                    countMessages(
+                            fine,
+                            "Looking up previous results of " + (newCases + 1) + " cases of '" + p.getFullName() + " #"
+                                    + build4.getNumber() + "' by query."));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_queriesInsteadOfLoadingMuchLargerCandidateBuild() throws Exception {
+        // Given: more than PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD cases of the current build #2, all
+        // present in #1, which has more than PREVIOUS_CASE_RESULT_MAX_LOAD_RATIO times as many cases --
+        // loading it would cost more than querying, so the query resolves them.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultLargeCandidate");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+
+            int cases = DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD + 1;
+            List<Object[]> rows = new ArrayList<>();
+            for (int i = 0; i < cases; i++) {
+                rows.add(new Object[] {build1.getNumber(), "test" + i, 1.0f});
+                rows.add(new Object[] {build2.getNumber(), "test" + i, 2.0f});
+            }
+            for (int i = 0; i < DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_MAX_LOAD_RATIO * cases; i++) {
+                rows.add(new Object[] {build1.getNumber(), "testNotInCurrentBuild" + i, 1.0f});
+            }
+            insertCases(p.getFullName(), rows.toArray(new Object[0][]));
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build2.getNumber());
+
+            // When/Then: the case still resolves to build #1, through the query alone.
+            Optional<CaseResult> previous = testResultStorage.getPreviousCaseResult(previousCaseLookup("test0"));
+            assertTrue(previous.isPresent());
+            assertEquals(1.0f, previous.get().getDuration(), 0.0001f);
+            assertEquals(0, countMessages(fine, " in memory."));
+            assertEquals(1, countMessages(fine, "Looking up previous results of " + cases + " cases of '"));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_doesNotQueryOnceEveryCandidateBuildWasMatchedInMemory() throws Exception {
+        // Given: more than PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD cases new in the current build #2,
+        // and a single earlier build #1 that is matched in memory -- nothing older is left to query.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultAllCandidatesWalked");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+
+            int cases = DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD + 1;
+            List<Object[]> rows = new ArrayList<>();
+            for (int i = 0; i < cases; i++) {
+                rows.add(new Object[] {build2.getNumber(), "newTest" + i, 2.0f});
+            }
+            rows.add(new Object[] {build1.getNumber(), "testNotInCurrentBuild", 1.0f});
+            insertCases(p.getFullName(), rows.toArray(new Object[0][]));
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build2.getNumber());
+
+            // When/Then: no previous result, and no query was issued for the empty remaining range.
+            assertEquals(Optional.empty(), testResultStorage.getPreviousCaseResult(previousCaseLookup("newTest0")));
+            assertEquals(1, countMessages(fine, " in memory."));
+            assertEquals(0, countMessages(fine, " by query."));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_keepsWalkingAfterProductiveBuild() throws Exception {
+        // Given: two groups of more than PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD cases in the current
+        // build #5: group A also in #3, group B also in #1, and #4 and #2 containing neither. The
+        // unproductive count from #4 must reset after #3, so #2 alone does not stop the walk before #1.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultProductiveReset");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build3 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build4 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build5 = jenkinsRule.buildAndAssertSuccess(p);
+
+            int groupSize = DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD + 1;
+            List<Object[]> rows = new ArrayList<>();
+            for (int i = 0; i < groupSize; i++) {
+                rows.add(new Object[] {build5.getNumber(), "testA" + i, 5.0f});
+                rows.add(new Object[] {build5.getNumber(), "testB" + i, 5.0f});
+                rows.add(new Object[] {build3.getNumber(), "testA" + i, 3.0f});
+                rows.add(new Object[] {build1.getNumber(), "testB" + i, 1.0f});
+            }
+            for (WorkflowRun filler : List.of(build2, build4)) {
+                rows.add(new Object[] {filler.getNumber(), "testNotInCurrentBuild", (float) filler.getNumber()});
+            }
+            insertCases(p.getFullName(), rows.toArray(new Object[0][]));
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build5.getNumber());
+
+            // When/Then: group A resolves to #3 and group B to #1, all of it in memory.
+            Optional<CaseResult> fromA = testResultStorage.getPreviousCaseResult(previousCaseLookup("testA0"));
+            assertTrue(fromA.isPresent());
+            assertEquals(3.0f, fromA.get().getDuration(), 0.0001f);
+            Optional<CaseResult> fromB = testResultStorage.getPreviousCaseResult(previousCaseLookup("testB0"));
+            assertTrue(fromB.isPresent());
+            assertEquals(1.0f, fromB.get().getDuration(), 0.0001f);
+            assertEquals(4, countMessages(fine, " in memory."));
+            assertEquals(0, countMessages(fine, " by query."));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_queriesAtInMemoryThreshold() throws Exception {
+        // Given: exactly PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD cases in the current build #2 and an
+        // earlier build #1 that is not loaded yet: that many cases are still queried, not loaded for.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultAtThreshold");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+
+            List<Object[]> rows = new ArrayList<>();
+            for (int i = 0; i < DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD; i++) {
+                rows.add(new Object[] {build1.getNumber(), "test" + i, 1.0f});
+                rows.add(new Object[] {build2.getNumber(), "test" + i, 2.0f});
+            }
+            insertCases(p.getFullName(), rows.toArray(new Object[0][]));
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build2.getNumber());
+
+            // When/Then: resolved to build #1 by the query.
+            Optional<CaseResult> previous = testResultStorage.getPreviousCaseResult(previousCaseLookup("test0"));
+            assertTrue(previous.isPresent());
+            assertEquals(1.0f, previous.get().getDuration(), 0.0001f);
+            assertEquals(0, countMessages(fine, " in memory."));
+            assertEquals(1, countMessages(fine, " by query."));
+        }
+    }
+
+    @Test
+    void getPreviousCaseResult_skipsCasesWithoutIdentityInMemory() throws Exception {
+        // Given: a row with a NULL suite in both the current build #2 and build #1, next to more than
+        // PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD regular cases matched in memory.
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE);
+                LogRecorder fine = new LogRecorder()
+                        .record(DatabaseTestResultStorage.class, Level.FINE)
+                        .capture(10000)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "previousCaseResultWithoutIdentity");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            WorkflowRun build1 = jenkinsRule.buildAndAssertSuccess(p);
+            WorkflowRun build2 = jenkinsRule.buildAndAssertSuccess(p);
+
+            int cases = DatabaseTestResultStorage.PREVIOUS_CASE_RESULT_IN_MEMORY_THRESHOLD + 1;
+            List<Object[]> rows = new ArrayList<>();
+            for (int i = 0; i < cases; i++) {
+                rows.add(new Object[] {build1.getNumber(), "test" + i, 1.0f});
+                rows.add(new Object[] {build2.getNumber(), "test" + i, 2.0f});
+            }
+            insertCases(p.getFullName(), rows.toArray(new Object[0][]));
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                            .getConnection();
+                    PreparedStatement insert = connection.prepareStatement(
+                            "INSERT INTO caseResults (job, build, suite, package, className, testName, duration) "
+                                    + "VALUES (?, ?, ?, '(root)', 'PreviousCaseResultTest', ?, 1.0)")) {
+                for (WorkflowRun run : List.of(build1, build2)) {
+                    insert.setString(1, p.getFullName());
+                    insert.setInt(2, run.getNumber());
+                    insert.setString(3, null);
+                    insert.setString(4, "testWithoutSuite");
+                    insert.addBatch();
+                }
+                insert.executeBatch();
+            }
+
+            var testResultStorage =
+                    (DatabaseTestResultStorage.TestResultStorage) storage.load(p.getFullName(), build2.getNumber());
+
+            // When/Then: the regular cases resolve to build #1 in memory, the NULL-suite row is skipped.
+            Optional<CaseResult> previous = testResultStorage.getPreviousCaseResult(previousCaseLookup("test0"));
+            assertTrue(previous.isPresent());
+            assertEquals(1.0f, previous.get().getDuration(), 0.0001f);
+            assertEquals(1, countMessages(fine, "Matched " + cases + " of " + cases + " cases of '"));
+        }
+    }
+
+    private static void insertCases(String job, Object[][] rows) throws Exception {
+        try (Connection connection = requireNonNull(
+                                GlobalDatabaseConfiguration.get().getDatabase())
+                        .getDataSource()
+                        .getConnection();
+                PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, duration) "
+                                + "VALUES (?, ?, 'suite1', '(root)', 'PreviousCaseResultTest', ?, ?)")) {
+            for (Object[] row : rows) {
+                insert.setString(1, job);
+                insert.setInt(2, (Integer) row[0]);
+                insert.setString(3, (String) row[1]);
+                insert.setFloat(4, (Float) row[2]);
+                insert.addBatch();
+            }
+            insert.executeBatch();
+        }
+    }
+
+    private static CaseResult previousCaseLookup(String testName) {
+        return new CaseResult(
+                new SuiteResult("suite1", null, null, null),
+                "PreviousCaseResultTest",
+                testName,
+                null,
+                null,
+                0.0f,
+                null,
+                null,
+                null);
+    }
+
+    private static long countMessages(LogRecorder recorder, String part) {
+        return recorder.getMessages().stream()
+                .filter(message -> message.contains(part))
+                .count();
+    }
+
+    @Test
     void getPreviousCaseResult_doesNotMatchBeyondBacktrackLimit() throws Exception {
         // Given: a case present only in build #1 and in the current build, with every build in
         // between (more than PREVIOUS_CASE_RESULT_BACKTRACK_BUILDS_MAX of them) having no row for it
