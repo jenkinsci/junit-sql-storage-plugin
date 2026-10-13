@@ -105,7 +105,7 @@ final class CaseResultSummaryTestSupport {
                 + "|failed=" + failed + "|skipped=" + skipped + "|" + duration;
     }
 
-    private static TestResult testResult(String xml) throws IOException {
+    static TestResult testResult(String xml) throws IOException {
         File reportsDir = Files.createTempDirectory("case-result-summaries").toFile();
         FileUtils.writeStringToFile(new File(reportsDir, "x.xml"), xml, StandardCharsets.UTF_8);
         DirectoryScanner directoryScanner = Util.createFileSet(reportsDir, "*.xml").getDirectoryScanner();

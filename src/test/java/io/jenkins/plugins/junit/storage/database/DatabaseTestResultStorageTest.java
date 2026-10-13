@@ -124,6 +124,16 @@ class DatabaseTestResultStorageTest {
     }
 
     @Test
+    void getPreviousCaseResult_resolvesNearestBuildAcrossLargeBuilds() throws Exception {
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+            PreviousCaseResultTestSupport.assertPreviousCaseResultsResolveToNearestBuild(jenkinsRule, storage);
+        }
+    }
+
+    @Test
     void forEachCaseResultSummary_matchesFullLoad() throws Exception {
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
@@ -784,6 +794,7 @@ class DatabaseTestResultStorageTest {
                     insert.setFloat(7, 4.5f);
                     insert.executeUpdate();
                 }
+                insertSummaries(connection, p.getFullName());
             }
 
             var testResultStorage =
@@ -865,6 +876,7 @@ class DatabaseTestResultStorageTest {
                         insert.executeUpdate();
                     }
                 }
+                insertSummaries(connection, p.getFullName());
             }
 
             var testResultStorage = (DatabaseTestResultStorage.TestResultStorage)
@@ -1640,6 +1652,23 @@ class DatabaseTestResultStorageTest {
                 columnValues[i - 1] = columnValue;
             }
             System.out.printf((format) + "%n", (Object[]) columnValues);
+        }
+    }
+
+    /**
+     * Rows inserted directly into caseResults bypass the publisher, which is what maintains caseResultsSummary
+     * (see RemotePublisherImpl#upsertSummary); derive the summary rows the publisher would have written.
+     */
+    private static void insertSummaries(Connection connection, String job) throws SQLException {
+        try (PreparedStatement insert = connection.prepareStatement(
+                "INSERT INTO caseResultsSummary (job, build, passCount, failCount, skipCount, duration) "
+                        + "SELECT job, build, "
+                        + "sum(case when errorDetails is null and skipped is null then 1 else 0 end), "
+                        + "sum(case when errorDetails is not null then 1 else 0 end), "
+                        + "sum(case when skipped is not null then 1 else 0 end), sum(duration) "
+                        + "FROM caseResults WHERE job = ? GROUP BY job, build")) {
+            insert.setString(1, job);
+            insert.executeUpdate();
         }
     }
 }
