@@ -14,6 +14,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Types;
+import hudson.model.Run;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -646,8 +647,8 @@ class DatabaseTestResultStorageTest {
     @Test
     void failedSince_testNeverPassed_reportsEarliestOccurrenceNotBuildOne() throws Exception {
         // Given: two test identities that are introduced partway through the job's history and have
-        // never passed since. Both computeFailedSinceRun (single-case) and
-        // computeFailedSinceBatchChunk (batched) must report the test's actual earliest occurrence as
+        // never passed since. Both computeSinceRun (single-case) and
+        // computeSinceBatchChunk (batched) must report the test's actual earliest occurrence as
         // its "failed since" build, not unconditionally build #1.
         try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
             setupPlugin(postgres);
@@ -667,11 +668,11 @@ class DatabaseTestResultStorageTest {
             String pkg = "(root)";
             String className = "NeverPassedTest";
             // Still currently failing in build #5 -- covered by the batched path
-            // (computeFailedSinceBatchChunk), since the Jelly views always load every currently
+            // (computeSinceBatchChunk), since the Jelly views always load every currently
             // failing case of the current build in one go.
             String stillFailingTestName = "testIntroducedFailingStillFailing";
             // No row at all in build #5 (e.g. the test was since removed) -- not covered by the
-            // batch, so resolving it exercises the single-case fallback path (computeFailedSinceRun).
+            // batch, so resolving it exercises the single-case fallback path (computeSinceRun).
             String removedTestName = "testIntroducedFailingThenRemoved";
 
             try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
@@ -726,6 +727,88 @@ class DatabaseTestResultStorageTest {
             assertEquals(build2.getNumber(), removedSinceRun.getNumber());
             assertNotEquals(build1.getNumber(), removedSinceRun.getNumber());
         }
+    }
+
+    @Test
+    void skippedSince_reportsFirstBuildOfCurrentSkippedStreak() throws Exception {
+        // Given: tests skipped across builds 1-5 with different histories, resolved both through the batched
+        // path (cases skipped in the current build #5) and the single-case fallback (a case absent from it).
+        try (PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(TEST_IMAGE)) {
+            setupPlugin(postgres);
+
+            DatabaseTestResultStorage storage = new DatabaseTestResultStorage();
+            JunitTestResultStorageConfiguration.get().setStorage(storage);
+
+            WorkflowJob p = jenkinsRule.createProject(WorkflowJob.class, "skippedSince");
+            p.setDefinition(new CpsFlowDefinition("node { echo 'build' }", true));
+            List<WorkflowRun> builds = new ArrayList<>();
+            for (int i = 0; i < 5; i++) {
+                builds.add(jenkinsRule.buildAndAssertSuccess(p));
+            }
+
+            String suite = "suite1";
+            String className = "SkippedTest";
+            // test name -> status per build 1-5: S skipped, F failed, P passed, - no row
+            Map<String, String> histories = Map.of(
+                    "skippedAfterFailing", "SFSSS",
+                    "skippedThroughMissingBuild", "PS-SS",
+                    "alwaysSkippedSinceIntroduced", "--S-S",
+                    "skippedThenRemoved", "PSS--",
+                    "failing", "SSSFF");
+
+            try (Connection connection = requireNonNull(GlobalDatabaseConfiguration.get().getDatabase()).getDataSource()
+                    .getConnection();
+                 PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO caseResults (job, build, suite, package, className, testName, errorDetails, skipped, duration) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")) {
+                for (Map.Entry<String, String> history : histories.entrySet()) {
+                    for (int i = 0; i < builds.size(); i++) {
+                        char status = history.getValue().charAt(i);
+                        if (status == '-') {
+                            continue;
+                        }
+                        insert.setString(1, p.getFullName());
+                        insert.setInt(2, builds.get(i).getNumber());
+                        insert.setString(3, suite);
+                        insert.setString(4, "(root)");
+                        insert.setString(5, className);
+                        insert.setString(6, history.getKey());
+                        insert.setString(7, status == 'F' ? "it broke" : null);
+                        // a skipped test without a message is stored as an empty string
+                        insert.setString(8, status == 'S' ? "" : null);
+                        insert.setFloat(9, 0.1f);
+                        insert.executeUpdate();
+                    }
+                }
+            }
+
+            var testResultStorage = (DatabaseTestResultStorage.TestResultStorage) storage.load(
+                    p.getFullName(), builds.get(4).getNumber());
+            SuiteResult suiteResult = new SuiteResult(suite, null, null, null);
+
+            // When/Then: a failed build ends the streak, a build without the test does not
+            assertEquals(builds.get(2).getNumber(),
+                    skippedSince(testResultStorage, suiteResult, className, "skippedAfterFailing"));
+            assertEquals(builds.get(1).getNumber(),
+                    skippedSince(testResultStorage, suiteResult, className, "skippedThroughMissingBuild"));
+            assertEquals(builds.get(2).getNumber(),
+                    skippedSince(testResultStorage, suiteResult, className, "alwaysSkippedSinceIntroduced"));
+            // single-case fallback, as the test is not in build #5
+            assertEquals(builds.get(1).getNumber(),
+                    skippedSince(testResultStorage, suiteResult, className, "skippedThenRemoved"));
+            // a failing test is not part of the skipped batch
+            assertEquals(builds.get(3).getNumber(),
+                    testResultStorage.getFailedSinceRun(new CaseResult(suiteResult, className, "failing", "it broke",
+                            null, 0.1f, null, null, null)).getNumber());
+        }
+    }
+
+    private static int skippedSince(DatabaseTestResultStorage.TestResultStorage testResultStorage,
+            SuiteResult suiteResult, String className, String testName) {
+        Run<?, ?> run = testResultStorage.getSkippedSinceRun(
+                new CaseResult(suiteResult, className, testName, null, "", 0.1f, null, null, null));
+        assertNotNull(run, testName);
+        return run.getNumber();
     }
 
     @Test
