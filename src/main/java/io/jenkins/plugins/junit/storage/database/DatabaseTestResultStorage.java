@@ -89,8 +89,8 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     static final int CASE_RESULT_SUMMARY_FETCH_SIZE = 5000;
 
     /**
-     * Number of failing {@link CaseResult}s whose "failed since" build is looked up in a single SQL
-     * round trip (see {@code computeFailedSinceBatch}), rather than one round trip per failing case.
+     * Number of failing (or skipped) {@link CaseResult}s whose "failed since" (or "skipped since") build is
+     * looked up in a single SQL round trip (see {@code computeSinceBatch}), rather than one round trip per case.
      * A test-report page lists every failing case and queries each one's "failed since" build, so
      * without batching, a build with hundreds of failing cases issued hundreds of sequential queries;
      * each query itself is index-backed and fast, but with a real (non-localhost) database connection
@@ -99,10 +99,32 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
      * of the original single-case subquery) for a bounded number of round trips. Kept well under
      * typical driver/database parameter-count and query-size limits.
      */
-    static final int FAILED_SINCE_BATCH_SIZE = 200;
+    static final int SINCE_BATCH_SIZE = 200;
 
     /**
-     * Same rationale and shape as {@link #FAILED_SINCE_BATCH_SIZE}, but for
+     * Consecutive builds in which a test kept failing ({@link TestResultImpl#getFailedSinceRun}) or kept being
+     * skipped ({@link TestResultImpl#getSkippedSinceRun}), as the SQL predicates for a build that continues the
+     * streak and for one that ends it ("passing", for a failing test).
+     */
+    enum Streak {
+        FAILED("errordetails IS NOT NULL", "errordetails IS NULL"),
+        SKIPPED("skipped IS NOT NULL", "skipped IS NULL");
+
+        final String ongoing;
+        final String ended;
+
+        Streak(String ongoing, String ended) {
+            this.ongoing = ongoing;
+            this.ended = ended;
+        }
+
+        boolean appliesTo(CaseResult caseResult) {
+            return this == FAILED ? caseResult.getErrorDetails() != null : caseResult.isSkipped();
+        }
+    }
+
+    /**
+     * Same rationale and shape as {@link #SINCE_BATCH_SIZE}, but for
      * {@link TestResultImpl#getPreviousCaseResult(CaseResult)}: a test-report page calls
      * {@link CaseResult#getPreviousResult()} once per case of the current build (not just failing
      * ones), so batching matters even more here.
@@ -1072,76 +1094,90 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         @Override
         public Run<?, ?> getFailedSinceRun(CaseResult caseResult) {
-            return withSpan("DatabaseTestResultStorage.TestResultStorage.getFailedSinceRun", span -> {
+            return getSinceRun(Streak.FAILED, caseResult,
+                    "DatabaseTestResultStorage.TestResultStorage.getFailedSinceRun");
+        }
+
+        // overrides TestResultImpl#getSkippedSinceRun once the junit dependency includes it
+        public Run<?, ?> getSkippedSinceRun(CaseResult caseResult) {
+            return getSinceRun(Streak.SKIPPED, caseResult,
+                    "DatabaseTestResultStorage.TestResultStorage.getSkippedSinceRun");
+        }
+
+        private Run<?, ?> getSinceRun(Streak streak, CaseResult caseResult, String spanName) {
+            return withSpan(spanName, span -> {
                 span.setAttribute("build", build);
                 span.setAttribute("job", job);
                 ResultsEntry entry = getEntry();
-                // Jelly views (e.g. the failed-tests list on the build/test-report pages) call this
-                // once per failing case shown on the page, so on the very first call for this build,
-                // eagerly compute "failed since" for every currently-failing case in as few round
-                // trips as possible (see computeFailedSinceBatch), rather than one pair of queries per
-                // case. Each individual query is index-backed and cheap on its own (a few
-                // milliseconds), but hundreds of sequential round trips to a non-localhost database
-                // multiply directly by per-round-trip network latency and can dominate page load time.
-                ensureFailedSinceBatchComputed(span, entry);
-                String cacheKey = failedSinceCacheKey(caseResult);
-                Run<?, ?> cached = entry.failedSinceRunByTest.get(cacheKey);
+                // Jelly views (e.g. the failed and skipped tests lists on the build/test-report pages) call
+                // this once per case shown on the page, so on the very first call for this build, eagerly
+                // compute it for every case in the streak in as few round trips as possible (see
+                // computeSinceBatch), rather than one pair of queries per case. Each individual query is
+                // index-backed and cheap on its own (a few milliseconds), but hundreds of sequential round
+                // trips to a non-localhost database multiply directly by per-round-trip network latency
+                // and can dominate page load time.
+                ensureSinceBatchComputed(streak, span, entry);
+                String cacheKey = sinceCacheKey(caseResult);
+                Map<String, Run<?, ?>> sinceRunByTest = entry.sinceRuns(streak).byTest;
+                Run<?, ?> cached = sinceRunByTest.get(cacheKey);
                 if (cached != null) {
                     return cached;
                 }
-                // Not covered by the batch (e.g. called for a currently-passing case, or a case not
-                // present in this build's loaded case list): fall back to the original single-case
-                // lookup, still memoized per test identity for this build.
-                return entry.getFailedSinceRun(cacheKey, () -> computeFailedSinceRun(span, caseResult));
+                // Not covered by the batch (e.g. called for a case not in the streak, or a case not
+                // present in this build's loaded case list): fall back to the single-case lookup, still
+                // memoized per test identity for this build.
+                return sinceRunByTest.computeIfAbsent(cacheKey, k -> computeSinceRun(streak, span, caseResult));
             });
         }
 
-        private String failedSinceCacheKey(CaseResult caseResult) {
+        private String sinceCacheKey(CaseResult caseResult) {
             return caseResult.getSuiteResult().getName() + '\0' + caseResult.getPackageName()
                     + '\0' + caseResult.getClassName() + '\0' + caseResult.getName();
         }
 
         /**
-         * Runs {@link #computeFailedSinceBatch(Span, ResultsEntry)} at most once per {@link ResultsEntry}
-         * (i.e. once per build per cache generation), guarded the same way as the other lazily-computed
-         * fields on {@link ResultsEntry}.
+         * Runs {@link #computeSinceBatch(Streak, Span, ResultsEntry)} at most once per {@link ResultsEntry}
+         * and streak (i.e. once per build per cache generation), guarded the same way as the other
+         * lazily-computed fields on {@link ResultsEntry}.
          */
-        private void ensureFailedSinceBatchComputed(Span span, ResultsEntry entry) {
-            if (entry.failedSinceBatchComputed) {
+        private void ensureSinceBatchComputed(Streak streak, Span span, ResultsEntry entry) {
+            SinceRuns sinceRuns = entry.sinceRuns(streak);
+            if (sinceRuns.batchComputed) {
                 return;
             }
-            synchronized (entry.failedSinceBatchLock) {
-                if (entry.failedSinceBatchComputed) {
+            synchronized (sinceRuns.batchLock) {
+                if (sinceRuns.batchComputed) {
                     return;
                 }
-                computeFailedSinceBatch(span, entry);
-                entry.failedSinceBatchComputed = true;
+                computeSinceBatch(streak, span, entry);
+                sinceRuns.batchComputed = true;
             }
         }
 
         /**
-         * Computes "failed since" for every currently-failing case of this build in a bounded number
-         * of SQL round trips (see {@link #FAILED_SINCE_BATCH_SIZE}), storing each result directly into
-         * {@link ResultsEntry#failedSinceRunByTest} keyed the same way as {@link #getFailedSinceRun}.
-         * Reuses the already-loaded case list (no extra query to enumerate failing cases, since the
-         * Jelly views that call {@link #getFailedSinceRun} always first call {@link #getFailedTests()}
-         * or otherwise already have the full case list loaded for this build).
+         * Computes "failed since" (or "skipped since") for every currently-failing (or skipped) case of this
+         * build in a bounded number of SQL round trips (see {@link #SINCE_BATCH_SIZE}), storing each result
+         * directly into {@link ResultsEntry#sinceRuns(Streak)} keyed the same way as {@link #getSinceRun}.
+         * Reuses the already-loaded case list (no extra query to enumerate the cases, since the Jelly views
+         * that call {@link #getFailedSinceRun} or {@link #getSkippedSinceRun} always first call
+         * {@link #getFailedTests()} or {@link #getSkippedTests()}, or otherwise already have the full case
+         * list loaded for this build).
          */
-        private void computeFailedSinceBatch(Span span, ResultsEntry entry) {
-            List<CaseResult> failing = entry.getCaseResults(span).stream()
-                    .filter(caseResult -> caseResult.getErrorDetails() != null)
+        private void computeSinceBatch(Streak streak, Span span, ResultsEntry entry) {
+            List<CaseResult> cases = entry.getCaseResults(span).stream()
+                    .filter(streak::appliesTo)
                     .collect(Collectors.toList());
-            for (int start = 0; start < failing.size(); start += FAILED_SINCE_BATCH_SIZE) {
-                List<CaseResult> chunk = failing.subList(start,
-                        Math.min(start + FAILED_SINCE_BATCH_SIZE, failing.size()));
-                computeFailedSinceBatchChunk(entry, chunk);
+            for (int start = 0; start < cases.size(); start += SINCE_BATCH_SIZE) {
+                List<CaseResult> chunk = cases.subList(start,
+                        Math.min(start + SINCE_BATCH_SIZE, cases.size()));
+                computeSinceBatchChunk(streak, entry, chunk);
             }
         }
 
-        private void computeFailedSinceBatchChunk(ResultsEntry entry, List<CaseResult> chunk) {
+        private void computeSinceBatchChunk(Streak streak, ResultsEntry entry, List<CaseResult> chunk) {
             query(connection -> {
                 boolean postgres = isPostgres(connection);
-                // See computeFailedSinceRun for why this predicate (and its bound job/classname/testname
+                // See computeSinceRun for why this predicate (and its bound job/classname/testname
                 // parameters) is only needed on PostgreSQL.
                 String identityHashPredicate = postgres
                         ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
@@ -1149,7 +1185,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
                 // Step 1: last passing build before this one, for every failing case in the chunk, in
                 // one query built from one UNION ALL branch per case -- each branch is an exact copy of
-                // the single-case query in computeFailedSinceRun, just labelled with its chunk index so
+                // the single-case query in computeSinceRun, just labelled with its chunk index so
                 // results can be matched back to the case they belong to.
                 StringBuilder passingSql = new StringBuilder();
                 for (int i = 0; i < chunk.size(); i++) {
@@ -1160,7 +1196,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                             .append("WHERE job = ? AND build < ? AND suite = ? AND package = ? ")
                             .append("AND classname = ? AND testname = ? ")
                             .append(identityHashPredicate)
-                            .append("AND errordetails IS NULL ORDER BY build DESC LIMIT 1) AS lastpassing");
+                            .append("AND ").append(streak.ended).append(" ORDER BY build DESC LIMIT 1) AS lastpassing");
                 }
                 var spanPassingBuild = createSpan("lastPassingBuildBatch");
                 addSqlAttribute(spanPassingBuild, passingSql.toString());
@@ -1242,7 +1278,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 // getBuildByNumber can return null for a discarded build; only cache
                                 // a hit, since ConcurrentHashMap#putIfAbsent rejects null values.
                                 if (run != null) {
-                                    entry.failedSinceRunByTest.putIfAbsent(failedSinceCacheKey(caseResult), run);
+                                    entry.sinceRuns(streak).byTest.putIfAbsent(sinceCacheKey(caseResult), run);
                                 }
                             }
                         }
@@ -1261,7 +1297,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                                 .append("WHERE job = ? AND build > ? AND suite = ? AND package = ? ")
                                 .append("AND classname = ? AND testname = ? ")
                                 .append(identityHashPredicate)
-                                .append("AND errordetails IS NOT NULL ORDER BY build ASC LIMIT 1) AS firstfailing");
+                                .append("AND ").append(streak.ongoing).append(" ORDER BY build ASC LIMIT 1) AS firstfailing");
                     }
                     var spanFailingBuild = createSpan("firstFailingBuildBatch");
                     addSqlAttribute(spanFailingBuild, failingSql.toString());
@@ -1294,7 +1330,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         // getBuildByNumber can return null for a discarded build; only cache a hit,
                         // since ConcurrentHashMap#putIfAbsent rejects null values.
                         if (run != null) {
-                            entry.failedSinceRunByTest.putIfAbsent(failedSinceCacheKey(caseResult), run);
+                            entry.sinceRuns(streak).byTest.putIfAbsent(sinceCacheKey(caseResult), run);
                         }
                     }
                 }
@@ -1416,7 +1452,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
 
         /**
          * Runs {@link #computePreviousCaseResultBatch(Span, ResultsEntry)} at most once per
-         * {@link ResultsEntry}, guarded the same way as {@link #ensureFailedSinceBatchComputed}.
+         * {@link ResultsEntry}, guarded the same way as {@link #ensureSinceBatchComputed}.
          */
         private void ensurePreviousCaseResultBatchComputed(Span span, ResultsEntry entry) {
             if (entry.previousCaseResultBatchComputed) {
@@ -1629,7 +1665,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 int minCandidateBuild, int maxCandidateBuildExclusive) {
             Map<Integer, Integer> foundBuildByIdx = query(connection -> {
                 boolean postgres = isPostgres(connection);
-                // See computeFailedSinceRun for why this predicate is only needed on PostgreSQL.
+                // See computeSinceRun for why this predicate is only needed on PostgreSQL.
                 String identityHashPredicate = postgres
                         ? "AND testidentityhash = md5(coalesce(?, '') || chr(1) || coalesce(?, '') || chr(1) || coalesce(?, '')) "
                         : "";
@@ -1714,7 +1750,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
             return suite == null ? null : suite.getCase(caseResult.getTransformedFullDisplayName());
         }
 
-        private Run<?, ?> computeFailedSinceRun(Span span, CaseResult caseResult) {
+        private Run<?, ?> computeSinceRun(Streak streak, Span span, CaseResult caseResult) {
             return query(connection -> {
                 var spanPassingBuild = createSpan("lastPassingBuild");
                 int lastPassingBuildNumber;
@@ -1748,7 +1784,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         "AND classname = ? " +
                         "AND testname = ? " +
                         identityHashPredicate +
-                        "AND errordetails IS NULL " +
+                        "AND " + streak.ended + " " +
                         "ORDER BY BUILD DESC " +
                         "LIMIT 1";
                 addSqlAttribute(spanPassingBuild, sqlPassingBuild);
@@ -1780,7 +1816,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                         "AND classname = ? " +
                         "AND testname = ? " +
                         identityHashPredicate +
-                        "AND errordetails is NOT NULL " +
+                        "AND " + streak.ongoing + " " +
                         "ORDER BY BUILD ASC " +
                         "LIMIT 1";
                 addSqlAttribute(spanFailingBuild, sqlFailedBuild);
@@ -2039,6 +2075,23 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     }
 
     /**
+     * Memoizes "failed since" (or "skipped since") builds per test identity within one build, so that Jelly
+     * views listing many failing (or skipped) cases, each of which looks up its own build, issue at most one
+     * pair of SQL queries per unique test per cache generation, instead of repeating them on every render of
+     * the same build's page.
+     */
+    private static final class SinceRuns {
+        private final Map<String, Run<?, ?>> byTest = new ConcurrentHashMap<>();
+
+        /**
+         * Guards {@code computeSinceBatch}: set once the batched computation has been attempted for this
+         * build (successfully or not), so it runs at most once per cache generation rather than once per case.
+         */
+        private volatile boolean batchComputed = false;
+        private final Object batchLock = new Object();
+    }
+
+    /**
      * Holds the lazily-computed, memoized results for one build: the full case list, the package
      * list derived from it, and the SQL-aggregated summary (counts/duration). Each is computed at
      * most once per cache generation, regardless of how many {@link TestResultStorage} instances or
@@ -2112,25 +2165,16 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
         private volatile Optional<TestResult> previousResult;
         private final Object previousResultLock = new Object();
 
-        /**
-         * Memoizes {@link #getFailedSinceRun(String, Supplier)} results per test identity within this
-         * build, so that Jelly views listing many failing cases (each of which looks up its own "failed
-         * since" build) issue at most one pair of SQL queries per unique failing test per cache
-         * generation, instead of repeating them on every render of the same build's page.
-         */
-        private final Map<String, Run<?, ?>> failedSinceRunByTest = new ConcurrentHashMap<>();
+        private final SinceRuns failedSinceRuns = new SinceRuns();
+        private final SinceRuns skippedSinceRuns = new SinceRuns();
 
-        /**
-         * Guards {@code computeFailedSinceBatch}: set once the batched "failed since" computation has
-         * been attempted for this build (successfully or not), so it runs at most once per cache
-         * generation rather than once per failing case.
-         */
-        private volatile boolean failedSinceBatchComputed = false;
-        private final Object failedSinceBatchLock = new Object();
+        SinceRuns sinceRuns(Streak streak) {
+            return streak == Streak.FAILED ? failedSinceRuns : skippedSinceRuns;
+        }
 
         /**
          * Memoizes {@link TestResultStorage#getPreviousCaseResult(CaseResult)} results per test
-         * identity within this build, analogous to {@link #failedSinceRunByTest}. Absence after
+         * identity within this build, analogous to {@link SinceRuns#byTest}. Absence after
          * {@link #previousCaseResultBatchComputed} is set means "determined there is no previous
          * result", not "not yet computed".
          */
@@ -2277,10 +2321,6 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
                 }
                 return local;
             }
-        }
-
-        Run<?, ?> getFailedSinceRun(String testKey, Supplier<Run<?, ?>> computer) {
-            return failedSinceRunByTest.computeIfAbsent(testKey, k -> computer.get());
         }
 
         private Optional<TestResult> loadPreviousResultFromDB(Span parentSpan) {
@@ -2508,7 +2548,7 @@ public class DatabaseTestResultStorage extends JunitTestResultStorage {
     /**
      * Whether the given connection is to PostgreSQL rather than MySQL, the two databases this
      * plugin supports. Used to select the PostgreSQL-specific {@code testidentityhash}-based
-     * variant of the "failed since" lookup query (see {@code computeFailedSinceRun}), which exists
+     * variant of the "failed since" lookup query (see {@code computeSinceRun}), which exists
      * because PostgreSQL's btree index entry size limit (unlike MySQL's prefix-length indexes)
      * cannot safely index the full job/classname/testname columns directly.
      */
